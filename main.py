@@ -1,94 +1,67 @@
 # ============================================================
-# ANIME FORWARDER TELEGRAM
+# AUTO FORWARDER TELEGRAM
 # VERSION COMPLETE
-# ============================================================
-#
-# FONCTIONS
-#
-# - Surveillance des sources Telegram
-# - Détection automatique de l'anime
-# - Recherche automatique des alias
-#   1. Nautiljon
-#   2. AniList en fallback
-# - Aucun alias à saisir manuellement
-# - Copie directe Telegram
-# - Aucun téléchargement
-# - Aucun renommage
-# - Légende automatique
-# - Gestion VF / VOSTFR
-# - Plusieurs destinations par source
-# - Configuration persistante JSON
-#
-# COMMANDES
-#
-# /start
-# /help
-# /config
-#
-# /sources
-# /addsource
-# /removesource
-#
-# /destinations
-# /adddestination
-# /removedestination
-# /linksource
-#
-# /animes
-# /addanime
-# /removeanime
-# /aliases
-#
+# STICKER AUTOMATIQUE APRÈS 3 MINUTES
 # ============================================================
 
 import os
 import re
 import json
 import logging
-import unicodedata
+import traceback
 import asyncio
-import requests
 
 from difflib import SequenceMatcher
+from urllib.parse import unquote
 
-from bs4 import BeautifulSoup
+import requests
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    BotCommand,
-)
+from telegram import Update, BotCommand
+from telegram.constants import ParseMode
+from telegram.request import HTTPXRequest
 
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
-
-from telegram.error import TelegramError
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
+TOKEN = "8734390269:AAF0K4N-8Crsr1Tjsy50FQS6RwemjVShma0"
+
+if not TOKEN:
+    raise RuntimeError(
+        "❌ Token Telegram manquant.\n"
+        "Définis la variable BOT_TOKEN."
+    )
+
+
 CONFIG_FILE = "config_B.json"
 
+# ------------------------------------------------------------
+# ADMIN
+# ------------------------------------------------------------
+
+ADMIN_IDS = {
+    5825526159
+}
+
 
 # ============================================================
-# LOGGING
+# STICKER DE FIN
 # ============================================================
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | AnimeForwarder | %(message)s",
-    level=logging.INFO,
-)
+# 3 minutes
+STICKER_DELAY = 3 * 60
 
-logger = logging.getLogger("AnimeForwarder")
+# Tâche actuellement programmée
+completion_task = None
 
 
 # ============================================================
@@ -96,10 +69,52 @@ logger = logging.getLogger("AnimeForwarder")
 # ============================================================
 
 DEFAULT_CONFIG = {
-    "sources": {},
-    "destinations": {},
-    "animes": {},
+
+    "sources": [
+        -1001694110649
+    ],
+
+    "destination": -1001569253891,
+
+    "completion_sticker_id": "",
+
+    "animes": {
+
+        "The Elusive Samurai": {
+            "enabled": True,
+            "season": 1,
+            "aliases": []
+        },
+
+        "I Became a Legend After My 10 Year-Long Last Stand": {
+            "enabled": True,
+            "season": 1,
+            "aliases": []
+        },
+
+        "Welcome to Demon School Iruma kun": {
+            "enabled": True,
+            "season": 4,
+            "aliases": [
+                "Welcome to Demon School Iruma-kun",
+                "Mairimashita Iruma-kun",
+                "Iruma-kun"
+            ]
+        }
+    }
 }
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("AUTO_FORWARDER")
 
 
 # ============================================================
@@ -107,267 +122,31 @@ DEFAULT_CONFIG = {
 # ============================================================
 
 def save_config(config):
-    tmp_file = CONFIG_FILE + ".tmp"
 
     try:
+
         with open(
-            tmp_file,
+            CONFIG_FILE,
             "w",
             encoding="utf-8"
-        ) as f:
+        ) as file:
 
             json.dump(
                 config,
-                f,
+                file,
                 ensure_ascii=False,
                 indent=4
             )
 
-        os.replace(
-            tmp_file,
-            CONFIG_FILE
+        logger.info(
+            f"💾 Configuration sauvegardée : {CONFIG_FILE}"
         )
 
-    except Exception:
-        logger.exception(
-            "Erreur sauvegarde configuration"
+    except Exception as error:
+
+        logger.error(
+            f"❌ Erreur sauvegarde : {error}"
         )
-
-
-# ============================================================
-# NORMALISATION SOURCES
-# ============================================================
-
-def normalize_sources(sources):
-
-    result = {}
-
-    if isinstance(sources, dict):
-
-        for source_id, data in sources.items():
-
-            source_id = str(source_id)
-
-            if isinstance(data, dict):
-
-                title = (
-                    data.get("title")
-                    or data.get("name")
-                    or source_id
-                )
-
-                destinations = data.get(
-                    "destinations",
-                    []
-                )
-
-                if isinstance(
-                    destinations,
-                    str
-                ):
-                    destinations = [
-                        destinations
-                    ]
-
-                if not isinstance(
-                    destinations,
-                    list
-                ):
-                    destinations = []
-
-                result[source_id] = {
-                    "title": str(title),
-                    "destinations": [
-                        str(x)
-                        for x in destinations
-                        if x is not None
-                    ],
-                }
-
-            elif isinstance(data, list):
-
-                result[source_id] = {
-                    "title": source_id,
-                    "destinations": [
-                        str(x)
-                        for x in data
-                    ],
-                }
-
-            else:
-
-                result[source_id] = {
-                    "title": str(data),
-                    "destinations": [],
-                }
-
-    elif isinstance(sources, list):
-
-        for item in sources:
-
-            if isinstance(item, str):
-
-                result[item] = {
-                    "title": item,
-                    "destinations": [],
-                }
-
-                continue
-
-            if not isinstance(item, dict):
-                continue
-
-            source_id = (
-                item.get("id")
-                or item.get("chat_id")
-                or item.get("source_id")
-                or item.get("channel_id")
-            )
-
-            if source_id is None:
-                continue
-
-            source_id = str(source_id)
-
-            title = (
-                item.get("title")
-                or item.get("name")
-                or source_id
-            )
-
-            destinations = item.get(
-                "destinations",
-                []
-            )
-
-            if isinstance(
-                destinations,
-                str
-            ):
-                destinations = [
-                    destinations
-                ]
-
-            if not isinstance(
-                destinations,
-                list
-            ):
-                destinations = []
-
-            result[source_id] = {
-                "title": str(title),
-                "destinations": [
-                    str(x)
-                    for x in destinations
-                ],
-            }
-
-    return result
-
-
-# ============================================================
-# NORMALISATION DESTINATIONS
-# ============================================================
-
-def normalize_destinations(destinations):
-
-    result = {}
-
-    if isinstance(
-        destinations,
-        dict
-    ):
-
-        for destination_id, data in destinations.items():
-
-            destination_id = str(
-                destination_id
-            )
-
-            if isinstance(
-                data,
-                dict
-            ):
-
-                title = (
-                    data.get("title")
-                    or data.get("name")
-                    or destination_id
-                )
-
-                result[destination_id] = {
-                    "title": str(title)
-                }
-
-            elif isinstance(
-                data,
-                list
-            ):
-
-                for destination in data:
-
-                    destination_id_2 = str(
-                        destination
-                    )
-
-                    result[destination_id_2] = {
-                        "title": destination_id_2
-                    }
-
-            else:
-
-                result[destination_id] = {
-                    "title": str(data)
-                }
-
-    elif isinstance(
-        destinations,
-        list
-    ):
-
-        for item in destinations:
-
-            if isinstance(
-                item,
-                str
-            ):
-
-                result[item] = {
-                    "title": item
-                }
-
-                continue
-
-            if not isinstance(
-                item,
-                dict
-            ):
-                continue
-
-            destination_id = (
-                item.get("id")
-                or item.get("chat_id")
-                or item.get("destination_id")
-            )
-
-            if destination_id is None:
-                continue
-
-            destination_id = str(
-                destination_id
-            )
-
-            title = (
-                item.get("title")
-                or item.get("name")
-                or destination_id
-            )
-
-            result[destination_id] = {
-                "title": str(title)
-            }
-
-    return result
 
 
 # ============================================================
@@ -376,11 +155,15 @@ def normalize_destinations(destinations):
 
 def load_config():
 
-    if not os.path.exists(
-        CONFIG_FILE
-    ):
+    if not os.path.exists(CONFIG_FILE):
 
-        config = DEFAULT_CONFIG.copy()
+        logger.info(
+            f"📁 Création de {CONFIG_FILE}"
+        )
+
+        config = json.loads(
+            json.dumps(DEFAULT_CONFIG)
+        )
 
         save_config(config)
 
@@ -392,69 +175,174 @@ def load_config():
             CONFIG_FILE,
             "r",
             encoding="utf-8"
-        ) as f:
+        ) as file:
 
-            data = json.load(f)
+            config = json.load(file)
+
+        if not isinstance(config, dict):
+
+            raise ValueError(
+                "Le fichier JSON doit contenir un objet."
+            )
+
+        config.setdefault(
+            "sources",
+            []
+        )
+
+        config.setdefault(
+            "destination",
+            None
+        )
+
+        config.setdefault(
+            "completion_sticker_id",
+            ""
+        )
+
+        config.setdefault(
+            "animes",
+            {}
+        )
+
+        # ----------------------------------------------------
+        # Sécurité des types
+        # ----------------------------------------------------
 
         if not isinstance(
-            data,
+            config["sources"],
+            list
+        ):
+
+            config["sources"] = []
+
+        if not isinstance(
+            config["animes"],
             dict
         ):
-            data = {}
 
-        config = {
-            "sources": normalize_sources(
-                data.get(
-                    "sources",
-                    {}
-                )
-            ),
+            config["animes"] = {}
 
-            "destinations": normalize_destinations(
-                data.get(
-                    "destinations",
-                    {}
-                )
-            ),
+        # ----------------------------------------------------
+        # MIGRATION ANIMES
+        # ----------------------------------------------------
 
-            "animes": (
-                data.get(
-                    "animes",
-                    {}
+        for name, data in list(
+            config["animes"].items()
+        ):
+
+            if isinstance(data, dict):
+
+                data.setdefault(
+                    "enabled",
+                    True
                 )
-                if isinstance(
-                    data.get(
-                        "animes",
-                        {}
-                    ),
-                    dict
+
+                data.setdefault(
+                    "season",
+                    1
                 )
-                else {}
-            ),
-        }
+
+                data.setdefault(
+                    "aliases",
+                    []
+                )
+
+                if not isinstance(
+                    data["aliases"],
+                    list
+                ):
+
+                    data["aliases"] = []
+
+            else:
+
+                config["animes"][name] = {
+
+                    "enabled": True,
+
+                    "season": 1,
+
+                    "aliases": []
+                }
+
+        # ----------------------------------------------------
+        # MIGRATION ANCIEN NOM DU STICKER
+        # ----------------------------------------------------
+
+        old_sticker = config.get(
+            "completion_sticker"
+        )
+
+        current_sticker = config.get(
+            "completion_sticker_id"
+        )
+
+        if (
+            not current_sticker
+            and old_sticker
+        ):
+
+            config["completion_sticker_id"] = (
+                old_sticker
+            )
+
+            logger.info(
+                "🔄 Ancien paramètre sticker migré."
+            )
+
+        # On garde uniquement le nouveau format
+        config.pop(
+            "completion_sticker",
+            None
+        )
 
         save_config(config)
 
         return config
 
-    except Exception:
+    except Exception as error:
 
-        logger.exception(
-            "Erreur chargement configuration"
+        logger.error(
+            f"❌ Erreur lecture config : {error}"
         )
 
-        return {
-            "sources": {},
-            "destinations": {},
-            "animes": {},
-        }
+        logger.info(
+            "🔄 Retour à la configuration par défaut."
+        )
 
+        config = json.loads(
+            json.dumps(DEFAULT_CONFIG)
+        )
+
+        save_config(config)
+
+        return config
+
+
+# ============================================================
+# CONFIGURATION ACTIVE
+# ============================================================
 
 CONFIG = load_config()
 
 
 # ============================================================
-# NORMALISATION TEXTE
+# UTILITAIRES
+# ============================================================
+
+def is_admin(user_id):
+
+    return user_id in ADMIN_IDS
+
+
+def persist_config():
+
+    save_config(CONFIG)
+
+
+# ============================================================
+# NORMALISATION
 # ============================================================
 
 def normalize_text(text):
@@ -464,48 +352,110 @@ def normalize_text(text):
 
     text = str(text)
 
-    text = unicodedata.normalize(
-        "NFKD",
-        text
-    )
+    # --------------------------------------------------------
+    # Décodage URL
+    # --------------------------------------------------------
 
-    text = "".join(
-        c
-        for c in text
-        if not unicodedata.combining(c)
-    )
+    text = unquote(text)
+
+    if "%" in text:
+
+        text = unquote(text)
 
     text = text.lower()
 
-    text = text.replace(
-        "_",
-        " "
+    # --------------------------------------------------------
+    # Accents
+    # --------------------------------------------------------
+
+    replacements = {
+
+        "à": "a",
+        "â": "a",
+        "ä": "a",
+        "á": "a",
+        "ã": "a",
+
+        "é": "e",
+        "è": "e",
+        "ê": "e",
+        "ë": "e",
+
+        "î": "i",
+        "ï": "i",
+
+        "ô": "o",
+        "ö": "o",
+
+        "ù": "u",
+        "û": "u",
+        "ü": "u",
+
+        "ç": "c"
+    }
+
+    for old, new in replacements.items():
+
+        text = text.replace(
+            old,
+            new
+        )
+
+    # --------------------------------------------------------
+    # Encodage 5B / 5D
+    # --------------------------------------------------------
+
+    text = re.sub(
+        r"(?<![a-z0-9])5b",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"(?<![a-z0-9])5d",
+        " ",
+        text
+    )
+
+    # --------------------------------------------------------
+    # %XX résiduels
+    # --------------------------------------------------------
+
+    text = re.sub(
+        r"%[0-9a-f]{2}",
+        " ",
+        text,
+        flags=re.I
+    )
+
+    # --------------------------------------------------------
+    # Ponctuation
+    # --------------------------------------------------------
+
+    text = re.sub(
+        r"[_\-.]+",
+        " ",
+        text
     )
 
     text = text.replace(
-        ".",
-        " "
-    )
-
-    text = text.replace(
-        "-",
+        "'",
         " "
     )
 
     text = re.sub(
-        r"[^\w\s]",
+        r"[()\[\]{}]+",
         " ",
-        text,
-        flags=re.UNICODE
+        text
     )
 
     text = re.sub(
         r"\s+",
         " ",
         text
-    ).strip()
+    )
 
-    return text
+    return text.strip()
 
 
 # ============================================================
@@ -513,618 +463,401 @@ def normalize_text(text):
 # ============================================================
 
 TECHNICAL_WORDS = {
+
+    "2160p",
+    "1440p",
     "1080p",
     "720p",
-    "2160p",
+    "576p",
     "480p",
     "360p",
+
     "4k",
+    "2k",
+
+    "hd",
     "fhd",
     "uhd",
-    "hd",
-
-    "x264",
-    "x265",
-    "h264",
-    "h265",
-    "hevc",
-    "avc",
-
-    "aac",
-    "ac3",
-    "flac",
-    "opus",
 
     "web",
     "webdl",
     "webrip",
 
     "bluray",
-    "bdrip",
-    "bd",
+    "brrip",
+    "dvdrip",
+    "hdtv",
+    "hdrip",
 
-    "multi",
-    "dual",
-    "audio",
+    "x264",
+    "x265",
+    "h264",
+    "h265",
+    "hevc",
+
+    "aac",
+    "ac3",
+    "eac3",
+    "flac",
+    "dts",
+
+    "10bit",
+    "8bit",
 
     "vostfr",
+    "vostf",
     "vost",
+
     "vf",
-    "vo",
+    "vff",
+    "vf2",
+
+    "french",
+    "francais",
+
+    "dub",
+    "dubbed",
 
     "hardsub",
     "softsub",
-    "subbed",
-    "dubbed",
 
-    "complete",
+    "hard",
+    "sub",
+
     "episode",
+    "episodes",
     "ep",
 
-    "proper",
-    "repack",
-    "batch",
+    "season",
+    "saison",
+
+    "streaming",
+
+    "truefrench",
 
     "mkv",
     "mp4",
     "avi",
     "mov",
-    "webm",
 
-    "10bit",
-    "8bit",
-
-    "aac2",
-    "5",
-    "1",
-    "2",
-    "0",
+    "subsplease",
+    "erai",
+    "erai-raws"
 }
 
 
 # ============================================================
-# NETTOYAGE TITRE FICHIER
+# NETTOYAGE NOM ANIME
 # ============================================================
 
-def clean_anime_title(filename):
+def clean_anime_words(text):
 
-    if not filename:
-        return ""
+    text = normalize_text(text)
 
-    name = os.path.basename(
-        str(filename)
-    )
-
-    name = re.sub(
-        r"\.(mkv|mp4|avi|mov|webm)$",
-        "",
-        name,
-        flags=re.IGNORECASE
-    )
-
-    name = name.replace(
-        "_",
-        " "
-    )
-
-    name = name.replace(
-        ".",
-        " "
-    )
-
-    # Groupe de fansub
-    name = re.sub(
-        r"\[[^\]]*\]",
+    # S01E07
+    text = re.sub(
+        r"\bs\d{1,2}e\d{1,4}\b",
         " ",
-        name
+        text,
+        flags=re.I
     )
 
-    # S01E01
-    name = re.sub(
-        r"\bS\d{1,2}\s*E\d{1,4}\b",
+    # 01x07
+    text = re.sub(
+        r"\b\d{1,2}x\d{1,4}\b",
         " ",
-        name,
-        flags=re.IGNORECASE
+        text,
+        flags=re.I
     )
 
-    # S01
-    name = re.sub(
-        r"\bS\d{1,2}\b",
+    # S01 07
+    text = re.sub(
+        r"\bs\d{1,2}\s+\d{1,4}\b",
         " ",
-        name,
-        flags=re.IGNORECASE
+        text,
+        flags=re.I
     )
 
-    # E01
-    name = re.sub(
-        r"\bE\d{1,4}\b",
+    # S03 - 08
+    text = re.sub(
+        r"\bs\d{1,2}\s*[- ]\s*\d{1,4}\b",
         " ",
-        name,
-        flags=re.IGNORECASE
+        text,
+        flags=re.I
     )
 
-    # Episode 01
-    name = re.sub(
-        r"\bEpisode[\s._-]*\d{1,4}\b",
+    # Episode 07
+    text = re.sub(
+        r"\b(?:episode|ep)\s*\d{1,4}\b",
         " ",
-        name,
-        flags=re.IGNORECASE
+        text,
+        flags=re.I
     )
 
-    words = name.split()
+    words = text.split()
 
     cleaned = []
 
     for word in words:
 
-        normalized = normalize_text(
+        if word in TECHNICAL_WORDS:
+
+            continue
+
+        if re.fullmatch(
+            r"s\d{1,2}",
+            word
+        ):
+
+            continue
+
+        if re.fullmatch(
+            r"e\d{1,4}",
+            word
+        ):
+
+            continue
+
+        if re.fullmatch(
+            r"\d{3,4}p",
+            word
+        ):
+
+            continue
+
+        if re.fullmatch(
+            r"\d{1,4}",
+            word
+        ):
+
+            continue
+
+        cleaned.append(
             word
         )
 
-        if normalized in TECHNICAL_WORDS:
-            continue
+    return cleaned
 
-        cleaned.append(word)
 
-    name = " ".join(
-        cleaned
+# ============================================================
+# SCORE
+# ============================================================
+
+def anime_match_score(
+    configured_name,
+    filename
+):
+
+    configured = normalize_text(
+        configured_name
     )
 
-    name = re.sub(
-        r"\s+",
-        " ",
-        name
-    ).strip()
-
-    return name
-
-
-# ============================================================
-# SAISON
-# ============================================================
-
-def extract_season(filename):
-
-    if not filename:
-        return 1
-
-    patterns = [
-        r"\bS(\d{1,2})\b",
-        r"\bSeason[\s._-]*(\d{1,2})\b",
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            filename,
-            flags=re.IGNORECASE
-        )
-
-        if match:
-
-            try:
-                return int(
-                    match.group(1)
-                )
-            except Exception:
-                pass
-
-    return 1
-
-
-# ============================================================
-# EPISODE
-# ============================================================
-
-def extract_episode(filename):
-
-    if not filename:
-        return None
-
-    patterns = [
-        r"\bS\d{1,2}\s*E(\d{1,4})\b",
-        r"\bS\d{1,2}E(\d{1,4})\b",
-        r"\bEP[\s._-]*(\d{1,4})\b",
-        r"\bEpisode[\s._-]*(\d{1,4})\b",
-        r"\bE[\s._-]*(\d{1,4})\b",
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            filename,
-            flags=re.IGNORECASE
-        )
-
-        if match:
-
-            try:
-                return int(
-                    match.group(1)
-                )
-            except Exception:
-                pass
-
-    return None
-
-
-# ============================================================
-# LANGUE
-# ============================================================
-
-def detect_language(filename):
-
-    text = normalize_text(
+    filename_normalized = normalize_text(
         filename
     )
 
-    vf_patterns = [
-        r"\bvf\b",
-        r"\bfrench\b",
-        r"\bdub\b",
-        r"\bdubbed\b",
-        r"\bfrancais\b",
-    ]
+    if not configured or not filename_normalized:
 
-    for pattern in vf_patterns:
+        return 0
 
-        if re.search(
-            pattern,
-            text
-        ):
-            return "VF"
+    # --------------------------------------------------------
+    # Correspondance exacte
+    # --------------------------------------------------------
 
-    vostfr_patterns = [
-        r"\bhardsub\b",
-        r"\bvostfr\b",
-        r"\bvost\b",
-        r"\bsoftsub\b",
-        r"\bsubbed\b",
-    ]
+    if configured in filename_normalized:
 
-    for pattern in vostfr_patterns:
-
-        if re.search(
-            pattern,
-            text
-        ):
-            return "VOSTFR"
-
-    return "VOSTFR"
-
-
-# ============================================================
-# SIMILARITÉ
-# ============================================================
-
-def similarity(a, b):
-
-    a = normalize_text(a)
-    b = normalize_text(b)
-
-    if not a or not b:
-        return 0.0
-
-    if a == b:
         return 1.0
 
-    if a in b or b in a:
-        return 0.95
+    configured_words = clean_anime_words(
+        configured
+    )
 
-    return SequenceMatcher(
+    filename_words = clean_anime_words(
+        filename_normalized
+    )
+
+    if not configured_words or not filename_words:
+
+        return 0
+
+    # --------------------------------------------------------
+    # Mots exacts
+    # --------------------------------------------------------
+
+    exact_matches = sum(
+        1
+        for word in configured_words
+        if word in filename_words
+    )
+
+    exact_score = (
+        exact_matches /
+        len(configured_words)
+    )
+
+    # --------------------------------------------------------
+    # Fuzzy phrase
+    # --------------------------------------------------------
+
+    phrase_score = SequenceMatcher(
         None,
-        a,
-        b
+        " ".join(configured_words),
+        " ".join(filename_words)
     ).ratio()
 
+    # --------------------------------------------------------
+    # Fuzzy mots
+    # --------------------------------------------------------
 
-# ============================================================
-# NORMALISATION ALIAS
-# ============================================================
+    fuzzy_matches = 0
 
-def normalize_aliases(aliases):
+    for wanted in configured_words:
 
-    result = []
-    seen = set()
+        best_ratio = max(
+            (
+                SequenceMatcher(
+                    None,
+                    wanted,
+                    found
+                ).ratio()
 
-    for alias in aliases:
-
-        if not alias:
-            continue
-
-        alias = str(
-            alias
-        ).strip()
-
-        if len(alias) < 2:
-            continue
-
-        normalized = normalize_text(
-            alias
+                for found in filename_words
+            ),
+            default=0
         )
 
-        if not normalized:
-            continue
+        if best_ratio >= 0.80:
 
-        if normalized in seen:
-            continue
+            fuzzy_matches += 1
 
-        seen.add(
-            normalized
-        )
+    fuzzy_score = (
+        fuzzy_matches /
+        len(configured_words)
+    )
 
-        result.append(
-            alias
-        )
-
-    return result
+    return max(
+        phrase_score,
+        exact_score,
+        fuzzy_score
+    )
 
 
 # ============================================================
-# RECHERCHE NAUTILJON
+# RECHERCHE ANIME
 # ============================================================
 
-def search_nautiljon_aliases(title):
+def find_configured_anime(text):
 
-    try:
+    if not text:
 
-        headers = {
-            "User-Agent":
-                "Mozilla/5.0 "
-                "(Linux; Android 13) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/120.0 Mobile Safari/537.36"
-        }
+        return None
 
-        search_url = (
-            "https://www.nautiljon.com/animes/"
-            "?q="
-            + requests.utils.quote(title)
-        )
+    best_anime = None
 
-        response = requests.get(
-            search_url,
-            headers=headers,
-            timeout=15
-        )
+    best_score = 0
 
-        if response.status_code != 200:
+    for anime_name, config in CONFIG["animes"].items():
 
-            logger.warning(
-                "Nautiljon HTTP %s",
-                response.status_code
-            )
-
-            return None
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
-
-        best_link = None
-        best_score = 0.0
-
-        # ----------------------------------------------------
-        # Recherche des résultats
-        # ----------------------------------------------------
-
-        for link in soup.find_all(
-            "a",
-            href=True
+        if not isinstance(
+            config,
+            dict
         ):
 
-            href = link.get(
-                "href",
-                ""
+            continue
+
+        if config.get(
+            "enabled",
+            True
+        ) is False:
+
+            continue
+
+        candidates = [
+            anime_name
+        ]
+
+        aliases = config.get(
+            "aliases",
+            []
+        )
+
+        if isinstance(
+            aliases,
+            list
+        ):
+
+            candidates.extend(
+                aliases
             )
 
-            text = link.get_text(
-                " ",
-                strip=True
-            )
+        anime_best_score = 0
 
-            if not text:
-                continue
+        anime_best_candidate = anime_name
 
-            if "/animes/" not in href:
-                continue
+        for candidate in candidates:
 
-            score = similarity(
-                title,
+            score = anime_match_score(
+                candidate,
                 text
             )
 
-            if score > best_score:
+            if score > anime_best_score:
 
-                best_score = score
-                best_link = link
+                anime_best_score = score
 
-        if not best_link:
-            return None
-
-        if best_score < 0.65:
-
-            logger.info(
-                "Résultat Nautiljon trop éloigné : %s | %.3f",
-                title,
-                best_score
-            )
-
-            return None
-
-        anime_url = best_link.get(
-            "href"
-        )
-
-        if anime_url.startswith("/"):
-
-            anime_url = (
-                "https://www.nautiljon.com"
-                + anime_url
-            )
-
-        # ----------------------------------------------------
-        # Page anime
-        # ----------------------------------------------------
-
-        page = requests.get(
-            anime_url,
-            headers=headers,
-            timeout=15
-        )
-
-        if page.status_code != 200:
-            return None
-
-        anime_soup = BeautifulSoup(
-            page.text,
-            "html.parser"
-        )
-
-        aliases = []
-
-        # Titre trouvé
-        found_title = best_link.get_text(
-            " ",
-            strip=True
-        )
-
-        if found_title:
-            aliases.append(
-                found_title
-            )
-
-        # Titre recherché
-        aliases.append(
-            title
-        )
-
-        # ----------------------------------------------------
-        # Recherche des titres dans la page
-        # ----------------------------------------------------
-
-        all_text = anime_soup.get_text(
-            "\n",
-            strip=True
-        )
-
-        lines = [
-            line.strip()
-            for line in all_text.splitlines()
-            if line.strip()
-        ]
-
-        for index, line in enumerate(lines):
-
-            normalized_line = normalize_text(
-                line
-            )
-
-            if (
-                "titre alternatif" in normalized_line
-                or "titres alternatifs" in normalized_line
-                or "autre titre" in normalized_line
-                or "autres titres" in normalized_line
-            ):
-
-                for next_line in lines[
-                    index + 1:index + 15
-                ]:
-
-                    if len(next_line) > 150:
-                        continue
-
-                    if next_line in (
-                        title,
-                        found_title
-                    ):
-                        continue
-
-                    aliases.append(
-                        next_line
-                    )
-
-        # ----------------------------------------------------
-        # Métadonnées
-        # ----------------------------------------------------
-
-        for meta in anime_soup.find_all(
-            "meta"
-        ):
-
-            content = meta.get(
-                "content"
-            )
-
-            if not content:
-                continue
-
-            if len(content) > 120:
-                continue
-
-            normalized_content = normalize_text(
-                content
-            )
-
-            if (
-                normalized_content
-                and (
-                    normalize_text(title)
-                    in normalized_content
-                    or
-                    normalized_content
-                    in normalize_text(title)
-                )
-            ):
-
-                aliases.append(
-                    content
-                )
-
-        aliases = normalize_aliases(
-            aliases
-        )
-
-        if not aliases:
-            return None
+                anime_best_candidate = candidate
 
         logger.info(
-            "Nautiljon trouvé : %s | %s",
-            title,
-            aliases
+            f"🔎 {anime_name} "
+            f"(via {anime_best_candidate}) : "
+            f"{anime_best_score * 100:.1f}%"
         )
 
-        return {
-            "aliases": aliases,
-            "source": "Nautiljon"
-        }
+        if anime_best_score > best_score:
 
-    except Exception:
+            best_score = anime_best_score
 
-        logger.exception(
-            "Erreur Nautiljon"
+            best_anime = anime_name
+
+    if best_anime is None:
+
+        logger.info(
+            "❌ Aucun anime correspondant."
         )
 
         return None
 
+    if best_score < 0.75:
+
+        logger.info(
+            f"❌ Anime non reconnu "
+            f"({best_score * 100:.1f}%)"
+        )
+
+        return None
+
+    logger.info(
+        f"🎬 Anime reconnu : "
+        f"{best_anime} "
+        f"({best_score * 100:.1f}%)"
+    )
+
+    return best_anime
+
 
 # ============================================================
-# RECHERCHE ANILIST
+# ANILIST
 # ============================================================
 
-def search_anilist_aliases(title):
+ANILIST_URL = "https://graphql.anilist.co"
 
-    try:
 
-        url = "https://graphql.anilist.co"
+def fetch_anime_aliases(name):
 
-        query = """
-        query ($search: String) {
-            Media(
+    query = """
+    query ($search: String) {
+        Page(page: 1, perPage: 5) {
+            media(
                 search: $search,
                 type: ANIME
             ) {
@@ -1138,48 +871,127 @@ def search_anilist_aliases(title):
                 synonyms
             }
         }
-        """
+    }
+    """
+
+    variables = {
+        "search": name
+    }
+
+    try:
 
         response = requests.post(
-            url,
+            ANILIST_URL,
             json={
                 "query": query,
-                "variables": {
-                    "search": title
-                }
-            },
-            headers={
-                "User-Agent": "AnimeForwarder"
+                "variables": variables
             },
             timeout=15
         )
 
-        if response.status_code != 200:
-
-            logger.warning(
-                "AniList HTTP %s",
-                response.status_code
-            )
-
-            return None
+        response.raise_for_status()
 
         data = response.json()
 
-        media = (
+        media_list = (
             data
             .get("data", {})
-            .get("Media")
+            .get("Page", {})
+            .get("media", [])
         )
 
-        if not media:
-            return None
+        if not media_list:
 
-        aliases = []
+            logger.info(
+                f"🔍 Aucun alias AniList trouvé pour : {name}"
+            )
 
-        media_title = media.get(
+            return []
+
+        normalized_name = normalize_text(
+            name
+        )
+
+        best_media = None
+
+        best_score = 0
+
+        for media in media_list:
+
+            titles = media.get(
+                "title",
+                {}
+            )
+
+            candidates = []
+
+            for key in (
+                "romaji",
+                "english",
+                "native",
+                "userPreferred"
+            ):
+
+                value = titles.get(
+                    key
+                )
+
+                if value:
+
+                    candidates.append(
+                        value
+                    )
+
+            candidates.extend(
+                media.get(
+                    "synonyms",
+                    []
+                ) or []
+            )
+
+            media_score = 0
+
+            for candidate in candidates:
+
+                score = SequenceMatcher(
+                    None,
+                    normalized_name,
+                    normalize_text(
+                        candidate
+                    )
+                ).ratio()
+
+                media_score = max(
+                    media_score,
+                    score
+                )
+
+            if media_score > best_score:
+
+                best_score = media_score
+
+                best_media = media
+
+        if not best_media:
+
+            return []
+
+        if best_score < 0.55:
+
+            logger.info(
+                f"⚠️ Résultat AniList trop incertain "
+                f"pour {name}: "
+                f"{best_score * 100:.1f}%"
+            )
+
+            return []
+
+        titles = best_media.get(
             "title",
             {}
         )
+
+        aliases = []
 
         for key in (
             "romaji",
@@ -1188,598 +1000,991 @@ def search_anilist_aliases(title):
             "userPreferred"
         ):
 
-            value = media_title.get(
+            value = titles.get(
                 key
             )
 
             if value:
+
                 aliases.append(
                     value
                 )
 
-        synonyms = media.get(
-            "synonyms",
-            []
+        aliases.extend(
+            best_media.get(
+                "synonyms",
+                []
+            ) or []
         )
 
-        if isinstance(
-            synonyms,
-            list
-        ):
+        final_aliases = []
 
-            aliases.extend(
-                synonyms
+        normalized_main = normalize_text(
+            name
+        )
+
+        existing = set()
+
+        for alias in aliases:
+
+            if not alias:
+
+                continue
+
+            alias = alias.strip()
+
+            if not alias:
+
+                continue
+
+            normalized = normalize_text(
+                alias
             )
 
-        aliases.append(
-            title
-        )
+            if normalized == normalized_main:
 
-        aliases = normalize_aliases(
-            aliases
-        )
+                continue
 
-        if not aliases:
-            return None
+            if normalized in existing:
+
+                continue
+
+            existing.add(
+                normalized
+            )
+
+            final_aliases.append(
+                alias
+            )
 
         logger.info(
-            "AniList trouvé : %s | %s",
-            title,
-            aliases
+            f"🔤 Alias automatiques pour "
+            f"{name} : {final_aliases}"
         )
 
-        return {
-            "aliases": aliases,
-            "source": "AniList"
-        }
+        return final_aliases
 
-    except Exception:
+    except Exception as error:
 
-        logger.exception(
-            "Erreur AniList"
+        logger.warning(
+            f"⚠️ Impossible de récupérer "
+            f"les alias AniList : {error}"
         )
 
-        return None
+        return []
 
 
 # ============================================================
-# RECHERCHE AUTOMATIQUE
+# AJOUT ALIAS
 # ============================================================
 
-def search_anime_automatically(title):
+def add_automatic_aliases(
+    anime_name,
+    aliases
+):
 
-    logger.info(
-        "Recherche automatique : %s",
-        title
+    if anime_name not in CONFIG["animes"]:
+
+        return []
+
+    config = CONFIG["animes"][anime_name]
+
+    current_aliases = config.setdefault(
+        "aliases",
+        []
     )
 
-    # --------------------------------------------------------
-    # 1. NAUTILJON
-    # --------------------------------------------------------
-
-    result = search_nautiljon_aliases(
-        title
-    )
-
-    if result:
-
-        return result
-
-    # --------------------------------------------------------
-    # 2. ANILIST
-    # --------------------------------------------------------
-
-    logger.info(
-        "Nautiljon sans résultat. "
-        "Fallback AniList."
-    )
-
-    result = search_anilist_aliases(
-        title
-    )
-
-    if result:
-
-        return result
-
-    # --------------------------------------------------------
-    # 3. Aucun résultat
-    # --------------------------------------------------------
-
-    return {
-        "aliases": [
-            title
-        ],
-        "source": "Aucune"
+    existing_normalized = {
+        normalize_text(alias)
+        for alias in current_aliases
     }
 
-
-# ============================================================
-# DÉTECTION ANIME
-# ============================================================
-
-def find_configured_anime(filename):
-
-    if not filename:
-        return None
-
-    raw_filename = os.path.basename(
-        str(filename)
+    main_normalized = normalize_text(
+        anime_name
     )
 
-    cleaned_filename = clean_anime_title(
-        raw_filename
-    )
+    added = []
 
-    normalized_filename = normalize_text(
-        cleaned_filename
-    )
+    for alias in aliases:
 
-    if not normalized_filename:
-        return None
+        normalized = normalize_text(
+            alias
+        )
 
-    candidates = []
+        if not normalized:
 
-    animes = CONFIG.get(
-        "animes",
-        {}
-    )
-
-    if not isinstance(
-        animes,
-        dict
-    ):
-        return None
-
-    for anime_id, anime in animes.items():
-
-        if not isinstance(
-            anime,
-            dict
-        ):
             continue
 
-        title = anime.get(
-            "title",
-            anime_id
+        if normalized == main_normalized:
+
+            continue
+
+        if normalized in existing_normalized:
+
+            continue
+
+        current_aliases.append(
+            alias
         )
 
-        names = [
-            str(title)
-        ]
-
-        aliases = anime.get(
-            "aliases",
-            []
+        existing_normalized.add(
+            normalized
         )
 
-        if isinstance(
-            aliases,
-            str
-        ):
-            aliases = [
-                aliases
-            ]
-
-        if isinstance(
-            aliases,
-            list
-        ):
-
-            names.extend(
-                str(alias)
-                for alias in aliases
-                if alias
-            )
-
-        unique_names = []
-
-        seen = set()
-
-        for name in names:
-
-            normalized_name = normalize_text(
-                name
-            )
-
-            if not normalized_name:
-                continue
-
-            if normalized_name in seen:
-                continue
-
-            seen.add(
-                normalized_name
-            )
-
-            unique_names.append(
-                normalized_name
-            )
-
-        for name in unique_names:
-
-            score = 0.0
-
-            # Exact
-            if normalized_filename == name:
-
-                score = 1.0
-
-            # Contenu
-            elif (
-                len(name) >= 3
-                and name in normalized_filename
-            ):
-
-                score = 0.97
-
-            else:
-
-                filename_words = (
-                    normalized_filename.split()
-                )
-
-                name_words = [
-                    word
-                    for word in name.split()
-                    if len(word) >= 3
-                ]
-
-                if name_words:
-
-                    matched = 0
-
-                    for word in name_words:
-
-                        for file_word in filename_words:
-
-                            if (
-                                word == file_word
-                                or similarity(
-                                    word,
-                                    file_word
-                                ) >= 0.92
-                            ):
-
-                                matched += 1
-                                break
-
-                    word_score = (
-                        matched
-                        / len(name_words)
-                    )
-
-                    full_score = similarity(
-                        normalized_filename,
-                        name
-                    )
-
-                    score = max(
-                        full_score,
-                        word_score * 0.95
-                    )
-
-            candidates.append(
-                (
-                    score,
-                    anime_id,
-                    anime,
-                    name
-                )
-            )
-
-    if not candidates:
-        return None
-
-    candidates.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    best_score, anime_id, anime, matched_name = (
-        candidates[0]
-    )
-
-    if best_score < 0.70:
-
-        logger.info(
-            "Anime non reconnu | fichier=%s | score=%.3f",
-            filename,
-            best_score
+        added.append(
+            alias
         )
 
-        return None
+    return added
 
-    logger.info(
-        "Anime reconnu | %s | alias=%s | score=%.3f",
-        anime.get(
-            "title",
-            anime_id
-        ),
-        matched_name,
-        best_score
-    )
 
-    return anime_id, anime
+# ============================================================
+# NOM FICHIER
+# ============================================================
+
+def get_message_filename(message):
+
+    if message.document:
+
+        return (
+            message.document.file_name
+            or ""
+        )
+
+    if message.video:
+
+        return (
+            message.video.file_name
+            or ""
+        )
+
+    if message.audio:
+
+        return (
+            message.audio.file_name
+            or ""
+        )
+
+    return ""
 
 
 # ============================================================
 # CAPTION
 # ============================================================
 
-def build_caption(
-    anime,
-    filename
-):
+def get_message_caption(message):
 
-    title = anime.get(
-        "title",
-        "Anime"
+    return message.caption or ""
+
+
+# ============================================================
+# LANGUE
+# ============================================================
+
+def detect_language(text):
+
+    if not text:
+
+        return ""
+
+    filename = os.path.basename(
+        str(text).strip()
     )
 
-    season = extract_season(
-        filename
-    )
+    filename_lower = filename.lower()
 
-    episode = extract_episode(
-        filename
-    )
+    # --------------------------------------------------------
+    # THREE.MKV
+    # --------------------------------------------------------
 
-    language = detect_language(
-        filename
-    )
+    if filename_lower == "three.mkv":
 
-    if episode is not None:
-
-        return (
-            f"🎬 {title}\n"
-            f"📀 Saison {season:02d} — "
-            f"Épisode {episode:02d}\n"
-            f"🌐 {language}"
+        logger.info(
+            "🇫🇷 THREE.mkv → VF"
         )
 
-    return (
-        f"🎬 {title}\n"
-        f"📀 Saison {season:02d}\n"
-        f"🌐 {language}"
+        return "VF"
+
+    upper = filename.upper()
+
+    upper = re.sub(
+        r"[._\-]+",
+        " ",
+        upper
     )
 
+    upper = re.sub(
+        r"\s+",
+        " ",
+        upper
+    ).strip()
 
-# ============================================================
-# LABEL SOURCE
-# ============================================================
+    # --------------------------------------------------------
+    # HARDSUB
+    # --------------------------------------------------------
 
-def source_label(source_id):
+    hardsub_patterns = [
 
-    source = CONFIG.get(
-        "sources",
-        {}
-    ).get(
-        str(source_id),
-        {}
-    )
-
-    if isinstance(
-        source,
-        dict
-    ):
-
-        return source.get(
-            "title",
-            str(source_id)
-        )
-
-    return str(source_id)
-
-
-# ============================================================
-# LABEL DESTINATION
-# ============================================================
-
-def destination_label(destination_id):
-
-    destination = CONFIG.get(
-        "destinations",
-        {}
-    ).get(
-        str(destination_id),
-        {}
-    )
-
-    if isinstance(
-        destination,
-        dict
-    ):
-
-        return destination.get(
-            "title",
-            str(destination_id)
-        )
-
-    return str(destination_id)
-
-
-# ============================================================
-# DESTINATIONS SOURCE
-# ============================================================
-
-def get_destinations_for_source(
-    source_id
-):
-
-    source = CONFIG.get(
-        "sources",
-        {}
-    ).get(
-        str(source_id)
-    )
-
-    if not isinstance(
-        source,
-        dict
-    ):
-        return []
-
-    destinations = source.get(
-        "destinations",
-        []
-    )
-
-    if isinstance(
-        destinations,
-        str
-    ):
-        destinations = [
-            destinations
-        ]
-
-    if not isinstance(
-        destinations,
-        list
-    ):
-        return []
-
-    return [
-        str(x)
-        for x in destinations
-        if x is not None
+        r"\bHARDSUB\b",
+        r"\bHARD\s+SUB\b",
+        r"\bHARD-SUB\b",
+        r"\bHARDSUBBED\b",
+        r"\bHARD\s+SUBBED\b"
     ]
 
+    for pattern in hardsub_patterns:
+
+        if re.search(
+            pattern,
+            upper,
+            re.I
+        ):
+
+            logger.info(
+                "🇫🇷 HARDSUB détecté → VOSTFR"
+            )
+
+            return "VOSTFR"
+
+    # --------------------------------------------------------
+    # VOSTFR
+    # --------------------------------------------------------
+
+    vostfr_patterns = [
+
+        r"\bVOSTFR\b",
+        r"\bVOSTF\b",
+        r"\bVOST\b",
+        r"\bSUBFRENCH\b",
+        r"\bSUB\s+FRENCH\b",
+        r"\bFRENCH\s+SUB\b",
+        r"\bFRENCH\s+SUBS\b",
+        r"\bFR\s+SUB\b",
+        r"\bSUB\s*FR\b"
+    ]
+
+    for pattern in vostfr_patterns:
+
+        if re.search(
+            pattern,
+            upper,
+            re.I
+        ):
+
+            logger.info(
+                "🇫🇷 VOSTFR détecté"
+            )
+
+            return "VOSTFR"
+
+    # --------------------------------------------------------
+    # VF
+    # --------------------------------------------------------
+
+    vf_patterns = [
+
+        r"\bTRUEFRENCH\b",
+        r"\bTRUE\s+FRENCH\b",
+        r"\bFRENCH\s+DUB\b",
+        r"\bFRENCH\s+DUBBED\b",
+        r"\bVFF\b",
+        r"\bVF2\b",
+        r"\bVF\b",
+        r"\bDUBBED\b",
+        r"\bDUB\b",
+        r"\bFRANCAIS\b",
+        r"\bFRANÇAIS\b"
+    ]
+
+    for pattern in vf_patterns:
+
+        if re.search(
+            pattern,
+            upper,
+            re.I
+        ):
+
+            logger.info(
+                "🇫🇷 VF détecté"
+            )
+
+            return "VF"
+
+    # --------------------------------------------------------
+    # GROUPES
+    # --------------------------------------------------------
+
+    if re.search(
+        r"\bSUBSPLEASE\b",
+        upper,
+        re.I
+    ):
+
+        logger.info(
+            "🇫🇷 SubsPlease détecté → VOSTFR"
+        )
+
+        return "VOSTFR"
+
+    if re.search(
+        r"\bERAI[\s\-]*RAWS\b",
+        upper,
+        re.I
+    ):
+
+        logger.info(
+            "🇫🇷 Erai-raws détecté → VOSTFR"
+        )
+
+        return "VOSTFR"
+
+    logger.info(
+        f"🇫🇷 Langue non détectée : {filename}"
+    )
+
+    return ""
+
 
 # ============================================================
-# START
+# QUALITÉ
 # ============================================================
 
-START_TEXT = """
-🤖 <b>ANIME FORWARDER</b>
+def detect_quality(text):
 
-Voici <b>toutes les commandes disponibles</b> :
+    if not text:
 
-━━━━━━━━━━━━━━━━━━
-📌 <b>GÉNÉRAL</b>
-━━━━━━━━━━━━━━━━━━
+        return ""
 
-/start
-→ Afficher toutes les commandes
+    match = re.search(
+        r"(?i)\b"
+        r"(2160p|1440p|1080p|720p|"
+        r"576p|480p|360p|HD|FHD|UHD)"
+        r"\b",
+        text
+    )
 
-/help
-→ Afficher toutes les commandes
+    if match:
 
-/config
-→ Menu de configuration
+        return match.group(1).upper()
 
-━━━━━━━━━━━━━━━━━━
-📡 <b>SOURCES</b>
-━━━━━━━━━━━━━━━━━━
-
-/sources
-→ Voir les sources
-
-/addsource
-→ Ajouter une source
-
-Format :
-<code>/addsource ID Nom</code>
-
-/removesource
-→ Supprimer une source
-
-Format :
-<code>/removesource ID</code>
-
-━━━━━━━━━━━━━━━━━━
-📤 <b>DESTINATIONS</b>
-━━━━━━━━━━━━━━━━━━
-
-/destinations
-→ Voir les destinations
-
-/adddestination
-→ Ajouter une destination
-
-Format :
-<code>/adddestination ID Nom</code>
-
-/removedestination
-→ Supprimer une destination
-
-Format :
-<code>/removedestination ID</code>
-
-/linksource
-→ Relier source et destination
-
-Format :
-<code>/linksource SOURCE DESTINATION</code>
-
-Plusieurs destinations :
-
-<code>/linksource SOURCE DEST1 DEST2 DEST3</code>
-
-━━━━━━━━━━━━━━━━━━
-🎬 <b>ANIMES</b>
-━━━━━━━━━━━━━━━━━━
-
-/animes
-→ Voir les animes
-
-/addanime
-→ Ajouter un anime
-
-Format :
-
-<code>/addanime Nom de l'anime</code>
-
-💡 Les alias sont recherchés automatiquement.
-
-Nautiljon est utilisé en premier.
-
-AniList est utilisé automatiquement
-si Nautiljon ne trouve rien.
-
-/removeanime
-→ Supprimer un anime
-
-Format :
-<code>/removeanime identifiant</code>
-
-/aliases
-→ Voir les alias récupérés
-
-Format :
-<code>/aliases identifiant</code>
-
-━━━━━━━━━━━━━━━━━━
-⚙️ <b>FONCTIONNEMENT</b>
-━━━━━━━━━━━━━━━━━━
-
-Le bot surveille les sources.
-
-Il analyse le nom du fichier.
-
-Il recherche automatiquement
-l'anime configuré.
-
-Puis il copie directement
-le message vers les destinations.
-
-📥 Aucun téléchargement
-🔄 Copie Telegram
-✏️ Aucun renommage
-📝 Légende automatique
-
-━━━━━━━━━━━━━━━━━━
-🌐 <b>LANGUES</b>
-━━━━━━━━━━━━━━━━━━
-
-HARDSUB → VOSTFR
-VOSTFR → VOSTFR
-VOST → VOSTFR
-VF → VF
-"""
+    return ""
 
 
-async def start_command(
+# ============================================================
+# SAISON / ÉPISODE
+# ============================================================
+
+def extract_episode(text):
+
+    if not text:
+
+        return None, None
+
+    cleaned = normalize_text(
+        text
+    )
+
+    # S03E08
+    match = re.search(
+        r"\bs\s*(\d{1,2})\s*e\s*(\d{1,4})\b",
+        cleaned,
+        re.I
+    )
+
+    if match:
+
+        return (
+            int(match.group(1)),
+            int(match.group(2))
+        )
+
+    # 03x08
+    match = re.search(
+        r"\b(\d{1,2})\s*x\s*(\d{1,4})\b",
+        cleaned,
+        re.I
+    )
+
+    if match:
+
+        return (
+            int(match.group(1)),
+            int(match.group(2))
+        )
+
+    # S03 - 08
+    match = re.search(
+        r"\bs\s*(\d{1,2})\s*[-_ ]\s*(\d{1,4})\b",
+        cleaned,
+        re.I
+    )
+
+    if match:
+
+        return (
+            int(match.group(1)),
+            int(match.group(2))
+        )
+
+    # Saison 3 épisode 8
+    match = re.search(
+        r"\b(?:saison|season)\s*(\d{1,2})"
+        r".*?"
+        r"(?:episode|ep)\s*(\d{1,4})\b",
+        cleaned,
+        re.I
+    )
+
+    if match:
+
+        return (
+            int(match.group(1)),
+            int(match.group(2))
+        )
+
+    # Episode 08
+    match = re.search(
+        r"\b(?:episode|ep)\s*(\d{1,4})\b",
+        cleaned,
+        re.I
+    )
+
+    if match:
+
+        return (
+            None,
+            int(match.group(1))
+        )
+
+    return None, None
+
+
+# ============================================================
+# ANALYSE MESSAGE
+# ============================================================
+
+def analyze_message(message):
+
+    filename = get_message_filename(
+        message
+    )
+
+    caption = get_message_caption(
+        message
+    )
+
+    # --------------------------------------------------------
+    # FICHIER
+    # --------------------------------------------------------
+
+    if filename:
+
+        logger.info(
+            f"📄 Fichier reçu : {filename}"
+        )
+
+        language = detect_language(
+            filename
+        )
+
+        anime = find_configured_anime(
+            filename
+        )
+
+        if anime:
+
+            season, episode = extract_episode(
+                filename
+            )
+
+            if season is None:
+
+                season = CONFIG["animes"][
+                    anime
+                ].get(
+                    "season"
+                )
+
+            return {
+
+                "anime": anime,
+
+                "season": season,
+
+                "episode": episode,
+
+                "language": language,
+
+                "quality": detect_quality(
+                    filename
+                ),
+
+                "source_text": filename,
+
+                "source_type": "filename",
+
+                "filename": filename
+            }
+
+    # --------------------------------------------------------
+    # CAPTION
+    # --------------------------------------------------------
+
+    if caption:
+
+        logger.info(
+            f"📝 Légende : {caption}"
+        )
+
+        language = detect_language(
+            caption
+        )
+
+        anime = find_configured_anime(
+            caption
+        )
+
+        if anime:
+
+            season, episode = extract_episode(
+                caption
+            )
+
+            if season is None:
+
+                season = CONFIG["animes"][
+                    anime
+                ].get(
+                    "season"
+                )
+
+            return {
+
+                "anime": anime,
+
+                "season": season,
+
+                "episode": episode,
+
+                "language": language,
+
+                "quality": detect_quality(
+                    caption
+                ),
+
+                "source_text": caption,
+
+                "source_type": "caption",
+
+                "filename": filename
+            }
+
+    return None
+
+
+# ============================================================
+# CAPTION DESTINATION
+# ============================================================
+
+def build_caption(info):
+
+    anime = info.get(
+        "anime",
+        ""
+    )
+
+    season = info.get(
+        "season"
+    )
+
+    episode = info.get(
+        "episode"
+    )
+
+    language = info.get(
+        "language",
+        ""
+    )
+
+    quality = info.get(
+        "quality",
+        ""
+    )
+
+    lines = []
+
+    if anime:
+
+        lines.append(
+            f"🎬 <b>{anime}</b>"
+        )
+
+    if (
+        season is not None
+        and episode is not None
+    ):
+
+        lines.append(
+            f"📀 Saison {season} — "
+            f"Épisode {episode}"
+        )
+
+    elif season is not None:
+
+        lines.append(
+            f"📀 Saison {season}"
+        )
+
+    elif episode is not None:
+
+        lines.append(
+            f"📺 Épisode {episode}"
+        )
+
+    if language:
+
+        if language == "VOSTFR":
+
+            lines.append(
+                "🇫🇷 VOSTFR"
+            )
+
+        elif language == "VF":
+
+            lines.append(
+                "🇫🇷 VF"
+            )
+
+        else:
+
+            lines.append(
+                f"🇫🇷 {language}"
+            )
+
+    if quality:
+
+        lines.append(
+            f"🎞 Qualité : {quality}"
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+# ============================================================
+# MESSAGES DÉJÀ TRAITÉS
+# ============================================================
+
+PROCESSED_MESSAGES = set()
+
+MAX_PROCESSED_MESSAGES = 2000
+
+
+def message_key(message):
+
+    return (
+        message.chat_id,
+        message.message_id
+    )
+
+
+def already_processed(message):
+
+    key = message_key(
+        message
+    )
+
+    if key in PROCESSED_MESSAGES:
+
+        return True
+
+    PROCESSED_MESSAGES.add(
+        key
+    )
+
+    if len(
+        PROCESSED_MESSAGES
+    ) > MAX_PROCESSED_MESSAGES:
+
+        while len(
+            PROCESSED_MESSAGES
+        ) > MAX_PROCESSED_MESSAGES:
+
+            PROCESSED_MESSAGES.pop()
+
+    return False
+
+
+# ============================================================
+# ANNULATION TIMER STICKER
+# ============================================================
+
+def cancel_completion_timer():
+
+    global completion_task
+
+    if completion_task is not None:
+
+        if not completion_task.done():
+
+            completion_task.cancel()
+
+            logger.info(
+                "⏹️ Ancien timer sticker annulé."
+            )
+
+    completion_task = None
+
+
+# ============================================================
+# TIMER STICKER
+# ============================================================
+
+async def completion_timer(
+    context
+):
+
+    global completion_task
+
+    try:
+
+        logger.info(
+            "⏳ Attente de 3 minutes "
+            "avant le sticker..."
+        )
+
+        await asyncio.sleep(
+            STICKER_DELAY
+        )
+
+        destination = CONFIG.get(
+            "destination"
+        )
+
+        sticker_id = CONFIG.get(
+            "completion_sticker_id"
+        )
+
+        if not destination:
+
+            logger.warning(
+                "⚠️ Destination absente."
+            )
+
+            return
+
+        if not sticker_id:
+
+            logger.warning(
+                "⚠️ Aucun sticker de fin configuré."
+            )
+
+            return
+
+        try:
+
+            await context.bot.send_sticker(
+                chat_id=destination,
+                sticker=sticker_id
+            )
+
+            logger.info(
+                "🧩 Sticker de fin envoyé "
+                "après 3 minutes sans nouvelle vidéo."
+            )
+
+        except Exception as error:
+
+            logger.error(
+                f"❌ Erreur envoi sticker : {error}"
+            )
+
+    except asyncio.CancelledError:
+
+        logger.info(
+            "⏹️ Timer sticker annulé "
+            "car une nouvelle vidéo est arrivée."
+        )
+
+        raise
+
+    finally:
+
+        # Ne supprimer la référence que si
+        # cette tâche est toujours la tâche active.
+        current_task = asyncio.current_task()
+
+        if completion_task is current_task:
+
+            completion_task = None
+
+
+# ============================================================
+# PROGRAMMER STICKER
+# ============================================================
+
+def schedule_completion_sticker(
+    context
+):
+
+    global completion_task
+
+    # --------------------------------------------------------
+    # Annuler le précédent
+    # --------------------------------------------------------
+
+    cancel_completion_timer()
+
+    # --------------------------------------------------------
+    # Vérifier qu'un sticker existe
+    # --------------------------------------------------------
+
+    sticker_id = CONFIG.get(
+        "completion_sticker_id"
+    )
+
+    if not sticker_id:
+
+        logger.info(
+            "🧩 Aucun sticker configuré. "
+            "Timer non démarré."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Nouveau timer
+    # --------------------------------------------------------
+
+    completion_task = context.application.create_task(
+        completion_timer(
+            context
+        ),
+        update=None,
+        name="completion_sticker_timer"
+    )
+
+    logger.info(
+        "⏱️ Nouveau timer sticker lancé : 3 minutes."
+    )
+
+
+# ============================================================
+# TRANSFERT
+# ============================================================
+
+async def forward_message(
+    message,
+    info,
+    context
+):
+
+    destination = CONFIG.get(
+        "destination"
+    )
+
+    if not destination:
+
+        logger.error(
+            "❌ Destination non configurée."
+        )
+
+        return False
+
+    caption = build_caption(
+        info
+    )
+
+    try:
+
+        # ----------------------------------------------------
+        # VIDÉO
+        # ----------------------------------------------------
+
+        if message.video:
+
+            await context.bot.send_video(
+                chat_id=destination,
+                video=message.video.file_id,
+                caption=caption or None,
+                parse_mode=ParseMode.HTML,
+                supports_streaming=True
+            )
+
+        # ----------------------------------------------------
+        # DOCUMENT
+        # ----------------------------------------------------
+
+        elif message.document:
+
+            await context.bot.send_document(
+                chat_id=destination,
+                document=message.document.file_id,
+                caption=caption or None,
+                parse_mode=ParseMode.HTML
+            )
+
+        # ----------------------------------------------------
+        # AUDIO
+        # ----------------------------------------------------
+
+        elif message.audio:
+
+            await context.bot.send_audio(
+                chat_id=destination,
+                audio=message.audio.file_id,
+                caption=caption or None,
+                parse_mode=ParseMode.HTML
+            )
+
+        # ----------------------------------------------------
+        # AUTRE
+        # ----------------------------------------------------
+
+        else:
+
+            await context.bot.copy_message(
+                chat_id=destination,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id
+            )
+
+        logger.info(
+            f"✅ Message publié vers {destination}"
+        )
+
+        # ----------------------------------------------------
+        # NOUVEAU TIMER
+        # ----------------------------------------------------
+        #
+        # Très important :
+        # le timer est lancé SEULEMENT après
+        # un transfert réussi.
+        # ----------------------------------------------------
+
+        schedule_completion_sticker(
+            context
+        )
+
+        return True
+
+    except Exception as error:
+
+        logger.error(
+            f"❌ Erreur transfert : {error}"
+        )
+
+        traceback.print_exc()
+
+        return False
+
+
+# ============================================================
+# RÉCEPTION MÉDIAS
+# ============================================================
+
+async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1787,13 +1992,149 @@ async def start_command(
     message = update.effective_message
 
     if not message:
+
         return
 
-    await message.reply_text(
-        START_TEXT,
-        parse_mode="HTML"
+    chat_id = message.chat_id
+
+    if chat_id not in CONFIG.get(
+        "sources",
+        []
+    ):
+
+        return
+
+    if already_processed(
+        message
+    ):
+
+        logger.info(
+            "⏭️ Message déjà traité."
+        )
+
+        return
+
+    info = analyze_message(
+        message
     )
 
+    if not info:
+
+        logger.info(
+            "⏭️ Message ignoré."
+        )
+
+        return
+
+    logger.info(
+        f"📌 Anime : {info['anime']}"
+    )
+
+    logger.info(
+        f"📌 Saison : {info.get('season')}"
+    )
+
+    logger.info(
+        f"📌 Épisode : {info.get('episode')}"
+    )
+
+    logger.info(
+        f"📌 Langue : {info.get('language')}"
+    )
+
+    logger.info(
+        f"📌 Qualité : {info.get('quality')}"
+    )
+
+    await forward_message(
+        message,
+        info,
+        context
+    )
+
+
+# ============================================================
+# ADMIN ONLY
+# ============================================================
+
+async def admin_only(
+    update,
+    context
+):
+
+    user = update.effective_user
+
+    if not user:
+
+        return False
+
+    if not is_admin(
+        user.id
+    ):
+
+        if update.effective_message:
+
+            await update.effective_message.reply_text(
+                "❌ Tu n'es pas autorisé à utiliser cette commande."
+            )
+
+        return False
+
+    return True
+
+
+# ============================================================
+# /START
+# ============================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not await admin_only(
+        update,
+        context
+    ):
+
+        return
+
+    text = (
+        "🤖 <b>AUTO FORWARDER</b>\n\n"
+        "✅ Bot actif.\n\n"
+
+        "<b>Commandes :</b>\n"
+        "/status\n"
+        "/sources\n"
+        "/destination\n"
+        "/animes\n\n"
+
+        "/addsource ID\n"
+        "/removesource ID\n"
+        "/setdestination ID\n\n"
+
+        "/addanime NOM | SAISON\n"
+        "/removeanime NOM\n"
+        "/enableanime NOM\n"
+        "/disableanime NOM\n\n"
+
+        "/addalias NOM | ALIAS\n"
+        "/removealias NOM | ALIAS\n\n"
+
+        "/sticker\n\n"
+
+        "/help"
+    )
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML
+    )
+
+
+# ============================================================
+# /HELP
+# ============================================================
 
 async def help_command(
     update: Update,
@@ -1807,7 +2148,96 @@ async def help_command(
 
 
 # ============================================================
-# SOURCES
+# /STATUS
+# ============================================================
+
+async def status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not await admin_only(
+        update,
+        context
+    ):
+
+        return
+
+    sources = CONFIG.get(
+        "sources",
+        []
+    )
+
+    destination = CONFIG.get(
+        "destination"
+    )
+
+    animes = CONFIG.get(
+        "animes",
+        {}
+    )
+
+    enabled = sum(
+        1
+        for data in animes.values()
+        if isinstance(data, dict)
+        and data.get(
+            "enabled",
+            True
+        )
+    )
+
+    total_aliases = sum(
+        len(
+            data.get(
+                "aliases",
+                []
+            )
+        )
+        for data in animes.values()
+        if isinstance(data, dict)
+    )
+
+    sticker = CONFIG.get(
+        "completion_sticker_id"
+    )
+
+    timer_status = (
+        "⏳ Actif"
+        if (
+            completion_task is not None
+            and not completion_task.done()
+        )
+        else "⏸️ Aucun"
+    )
+
+    text = (
+        "🤖 <b>STATUS</b>\n\n"
+
+        "🟢 Bot actif\n\n"
+
+        f"📡 Sources : {len(sources)}\n"
+        f"🎯 Destination : {destination}\n"
+
+        f"🎬 Animes : {len(animes)}\n"
+        f"🔤 Alias : {total_aliases}\n"
+        f"✅ Animes actifs : {enabled}\n\n"
+
+        f"🧩 Sticker : "
+        f"{'✅ Configuré' if sticker else '❌ Non configuré'}\n"
+
+        f"⏱️ Timer : {timer_status}\n"
+        f"⌛ Délai : 3 minutes"
+    )
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML
+    )
+
+
+# ============================================================
+# /SOURCES
 # ============================================================
 
 async def sources_command(
@@ -1815,591 +2245,96 @@ async def sources_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    message = update.effective_message
+    if not await admin_only(
+        update,
+        context
+    ):
 
-    if not message:
         return
 
     sources = CONFIG.get(
         "sources",
-        {}
+        []
     )
 
     if not sources:
 
-        await message.reply_text(
-            "📭 Aucune source configurée.\n\n"
-            "Utilise :\n"
-            "<code>/addsource ID Nom</code>",
-            parse_mode="HTML"
+        text = (
+            "📡 <b>SOURCES</b>\n\n"
+            "Aucune source configurée."
         )
 
-        return
-
-    lines = [
-        "📡 <b>SOURCES CONFIGURÉES</b>\n"
-    ]
-
-    for source_id, source in sources.items():
-
-        if not isinstance(
-            source,
-            dict
-        ):
-            continue
-
-        title = source.get(
-            "title",
-            source_id
-        )
-
-        destinations = source.get(
-            "destinations",
-            []
-        )
-
-        lines.append(
-            f"📥 <b>{title}</b>"
-        )
-
-        lines.append(
-            f"🆔 <code>{source_id}</code>"
-        )
-
-        if destinations:
-
-            lines.append(
-                "📤 Destinations :"
-            )
-
-            for destination_id in destinations:
-
-                lines.append(
-                    f"   • "
-                    f"{destination_label(destination_id)} "
-                    f"(<code>{destination_id}</code>)"
-                )
-
-        else:
-
-            lines.append(
-                "⚠️ Aucune destination liée"
-            )
-
-        lines.append("")
-
-    await message.reply_text(
-        "\n".join(lines),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# ADDSOURCE
-# ============================================================
-
-async def addsource_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-
-    if not message:
-        return
-
-    if not context.args:
-
-        await message.reply_text(
-            "❌ Utilisation :\n\n"
-            "<code>/addsource ID Nom de la source</code>",
-            parse_mode="HTML"
-        )
-
-        return
-
-    source_id = str(
-        context.args[0]
-    )
-
-    title = " ".join(
-        context.args[1:]
-    ).strip()
-
-    if not title:
-        title = source_id
-
-    old_source = CONFIG[
-        "sources"
-    ].get(
-        source_id,
-        {}
-    )
-
-    old_destinations = []
-
-    if isinstance(
-        old_source,
-        dict
-    ):
-
-        old_destinations = old_source.get(
-            "destinations",
-            []
-        )
-
-        if not isinstance(
-            old_destinations,
-            list
-        ):
-            old_destinations = []
-
-    CONFIG[
-        "sources"
-    ][source_id] = {
-        "title": title,
-        "destinations": old_destinations,
-    }
-
-    save_config(
-        CONFIG
-    )
-
-    await message.reply_text(
-        "✅ <b>Source ajoutée</b>\n\n"
-        f"📥 {title}\n"
-        f"🆔 <code>{source_id}</code>\n\n"
-        "Relie-la maintenant avec :\n"
-        f"<code>/linksource {source_id} DESTINATION_ID</code>",
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# REMOVESOURCE
-# ============================================================
-
-async def removesource_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-
-    if not message:
-        return
-
-    if not context.args:
-
-        await message.reply_text(
-            "❌ Utilisation :\n"
-            "<code>/removesource ID</code>",
-            parse_mode="HTML"
-        )
-
-        return
-
-    source_id = str(
-        context.args[0]
-    )
-
-    source = CONFIG[
-        "sources"
-    ].pop(
-        source_id,
-        None
-    )
-
-    if source is None:
-
-        await message.reply_text(
-            "❌ Source introuvable."
-        )
-
-        return
-
-    save_config(
-        CONFIG
-    )
-
-    title = (
-        source.get(
-            "title",
-            source_id
-        )
-        if isinstance(
-            source,
-            dict
-        )
-        else source_id
-    )
-
-    await message.reply_text(
-        f"✅ Source supprimée : <b>{title}</b>",
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# DESTINATIONS
-# ============================================================
-
-async def destinations_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-
-    if not message:
-        return
-
-    destinations = CONFIG.get(
-        "destinations",
-        {}
-    )
-
-    if not destinations:
-
-        await message.reply_text(
-            "📭 Aucune destination configurée.\n\n"
-            "Utilise :\n"
-            "<code>/adddestination ID Nom</code>",
-            parse_mode="HTML"
-        )
-
-        return
-
-    lines = [
-        "📤 <b>DESTINATIONS CONFIGURÉES</b>\n"
-    ]
-
-    for destination_id, destination in destinations.items():
-
-        if not isinstance(
-            destination,
-            dict
-        ):
-            continue
-
-        title = destination.get(
-            "title",
-            destination_id
-        )
-
-        lines.append(
-            f"📤 <b>{title}</b>"
-        )
-
-        lines.append(
-            f"🆔 <code>{destination_id}</code>"
-        )
-
-        lines.append("")
-
-    await message.reply_text(
-        "\n".join(lines),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# ADDDESTINATION
-# ============================================================
-
-async def adddestination_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-
-    if not message:
-        return
-
-    if not context.args:
-
-        await message.reply_text(
-            "❌ Utilisation :\n\n"
-            "<code>/adddestination ID Nom</code>",
-            parse_mode="HTML"
-        )
-
-        return
-
-    destination_id = str(
-        context.args[0]
-    )
-
-    title = " ".join(
-        context.args[1:]
-    ).strip()
-
-    if not title:
-        title = destination_id
-
-    CONFIG[
-        "destinations"
-    ][destination_id] = {
-        "title": title
-    }
-
-    save_config(
-        CONFIG
-    )
-
-    await message.reply_text(
-        "✅ <b>Destination ajoutée</b>\n\n"
-        f"📤 {title}\n"
-        f"🆔 <code>{destination_id}</code>\n\n"
-        "Relie-la avec :\n"
-        f"<code>/linksource SOURCE_ID {destination_id}</code>",
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# REMOVEDESTINATION
-# ============================================================
-
-async def removedestination_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-
-    if not message:
-        return
-
-    if not context.args:
-
-        await message.reply_text(
-            "❌ Utilisation :\n"
-            "<code>/removedestination ID</code>",
-            parse_mode="HTML"
-        )
-
-        return
-
-    destination_id = str(
-        context.args[0]
-    )
-
-    destination = CONFIG[
-        "destinations"
-    ].pop(
-        destination_id,
-        None
-    )
-
-    if destination is None:
-
-        await message.reply_text(
-            "❌ Destination introuvable."
-        )
-
-        return
-
-    for source in CONFIG[
-        "sources"
-    ].values():
-
-        if not isinstance(
-            source,
-            dict
-        ):
-            continue
-
-        destinations = source.get(
-            "destinations",
-            []
-        )
-
-        if isinstance(
-            destinations,
-            list
-        ):
-
-            source[
-                "destinations"
-            ] = [
-                x
-                for x in destinations
-                if str(x) != destination_id
-            ]
-
-    save_config(
-        CONFIG
-    )
-
-    title = (
-        destination.get(
-            "title",
-            destination_id
-        )
-        if isinstance(
-            destination,
-            dict
-        )
-        else destination_id
-    )
-
-    await message.reply_text(
-        f"✅ Destination supprimée : <b>{title}</b>",
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# LINKSOURCE
-# ============================================================
-
-async def linksource_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-
-    if not message:
-        return
-
-    if len(
-        context.args
-    ) < 2:
-
-        await message.reply_text(
-            "❌ Utilisation :\n\n"
-            "<code>/linksource SOURCE DESTINATION</code>\n\n"
-            "Plusieurs destinations :\n"
-            "<code>/linksource SOURCE DEST1 DEST2 DEST3</code>",
-            parse_mode="HTML"
-        )
-
-        return
-
-    source_id = str(
-        context.args[0]
-    )
-
-    destination_ids = [
-        str(x)
-        for x in context.args[1:]
-    ]
-
-    if source_id not in CONFIG[
-        "sources"
-    ]:
-
-        await message.reply_text(
-            "❌ Source introuvable.\n\n"
-            "Ajoute-la avec :\n"
-            f"<code>/addsource {source_id} Nom</code>",
-            parse_mode="HTML"
-        )
-
-        return
-
-    missing = [
-        destination_id
-        for destination_id in destination_ids
-        if destination_id not in CONFIG[
-            "destinations"
+    else:
+
+        lines = [
+            "📡 <b>SOURCES</b>",
+            ""
         ]
-    ]
 
-    if missing:
+        for index, source in enumerate(
+            sources,
+            start=1
+        ):
 
-        await message.reply_text(
-            "❌ Destination(s) introuvable(s) :\n\n"
-            + "\n".join(
-                f"• <code>{x}</code>"
-                for x in missing
-            ),
-            parse_mode="HTML"
-        )
-
-        return
-
-    source = CONFIG[
-        "sources"
-    ][source_id]
-
-    current = source.get(
-        "destinations",
-        []
-    )
-
-    if not isinstance(
-        current,
-        list
-    ):
-        current = []
-
-    added = []
-
-    for destination_id in destination_ids:
-
-        if destination_id not in current:
-
-            current.append(
-                destination_id
+            lines.append(
+                f"{index}. <code>{source}</code>"
             )
 
-            added.append(
-                destination_id
-            )
-
-    source[
-        "destinations"
-    ] = current
-
-    save_config(
-        CONFIG
-    )
-
-    if not added:
-
-        await message.reply_text(
-            "ℹ️ Ces destinations sont déjà liées."
+        text = "\n".join(
+            lines
         )
 
-        return
-
-    lines = [
-        "✅ <b>SOURCE RELIÉE</b>\n",
-        f"📥 {source_label(source_id)}",
-        f"🆔 <code>{source_id}</code>",
-        "",
-        "📤 Destinations :",
-    ]
-
-    for destination_id in added:
-
-        lines.append(
-            f"• {destination_label(destination_id)} "
-            f"(<code>{destination_id}</code>)"
-        )
-
-    await message.reply_text(
-        "\n".join(lines),
-        parse_mode="HTML"
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML
     )
 
 
 # ============================================================
-# ANIMES
+# /DESTINATION
 # ============================================================
 
-async def list_animes(
+async def destination_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    message = update.effective_message
+    if not await admin_only(
+        update,
+        context
+    ):
 
-    if not message:
+        return
+
+    destination = CONFIG.get(
+        "destination"
+    )
+
+    text = (
+        "🎯 <b>DESTINATION</b>\n\n"
+        f"<code>{destination}</code>"
+    )
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML
+    )
+
+
+# ============================================================
+# /ANIMES
+# ============================================================
+
+async def animes_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not await admin_only(
+        update,
+        context
+    ):
+
         return
 
     animes = CONFIG.get(
@@ -2409,68 +2344,251 @@ async def list_animes(
 
     if not animes:
 
-        await message.reply_text(
-            "📭 Aucun anime configuré.\n\n"
-            "Ajoute-en un avec :\n"
-            "<code>/addanime Nom de l'anime</code>",
-            parse_mode="HTML"
+        await update.effective_message.reply_text(
+            "🎬 Aucun anime configuré."
         )
 
         return
 
     lines = [
-        "📚 <b>ANIMES CONFIGURÉS</b>\n"
+        "🎬 <b>ANIMES CONFIGURÉS</b>",
+        ""
     ]
 
-    for anime_id, anime in animes.items():
+    for name, data in animes.items():
 
         if not isinstance(
-            anime,
+            data,
             dict
         ):
+
             continue
 
-        title = anime.get(
-            "title",
-            anime_id
+        enabled = data.get(
+            "enabled",
+            True
         )
 
-        aliases = anime.get(
+        season = data.get(
+            "season",
+            1
+        )
+
+        aliases = data.get(
             "aliases",
             []
         )
 
-        source = anime.get(
-            "alias_source",
-            "Inconnue"
+        icon = (
+            "✅"
+            if enabled
+            else "❌"
         )
 
         lines.append(
-            f"🎬 <b>{title}</b>"
+            f"{icon} <b>{name}</b>"
         )
 
         lines.append(
-            f"🆔 <code>{anime_id}</code>"
+            f"   Saison : {season}"
         )
 
-        lines.append(
-            f"🔹 Alias : {len(aliases)}"
-        )
+        if aliases:
 
-        lines.append(
-            f"🌐 Source : {source}"
-        )
+            lines.append(
+                "   Alias : "
+                + ", ".join(
+                    aliases
+                )
+            )
 
         lines.append("")
 
-    await message.reply_text(
+    await update.effective_message.reply_text(
         "\n".join(lines),
-        parse_mode="HTML"
+        parse_mode=ParseMode.HTML
     )
 
 
 # ============================================================
-# ADDANIME AUTOMATIQUE
+# /ADDSOURCE
+# ============================================================
+
+async def addsource_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not await admin_only(
+        update,
+        context
+    ):
+
+        return
+
+    if not context.args:
+
+        await update.effective_message.reply_text(
+            "❌ Utilisation :\n/addsource ID"
+        )
+
+        return
+
+    try:
+
+        source_id = int(
+            context.args[0]
+        )
+
+    except ValueError:
+
+        await update.effective_message.reply_text(
+            "❌ L'ID doit être un nombre."
+        )
+
+        return
+
+    sources = CONFIG.setdefault(
+        "sources",
+        []
+    )
+
+    if source_id in sources:
+
+        await update.effective_message.reply_text(
+            "⚠️ Cette source existe déjà."
+        )
+
+        return
+
+    sources.append(
+        source_id
+    )
+
+    persist_config()
+
+    await update.effective_message.reply_text(
+        f"✅ Source ajoutée :\n"
+        f"<code>{source_id}</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+# ============================================================
+# /REMOVESOURCE
+# ============================================================
+
+async def removesource_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not await admin_only(
+        update,
+        context
+    ):
+
+        return
+
+    if not context.args:
+
+        await update.effective_message.reply_text(
+            "❌ Utilisation :\n/removesource ID"
+        )
+
+        return
+
+    try:
+
+        source_id = int(
+            context.args[0]
+        )
+
+    except ValueError:
+
+        await update.effective_message.reply_text(
+            "❌ ID invalide."
+        )
+
+        return
+
+    sources = CONFIG.get(
+        "sources",
+        []
+    )
+
+    if source_id not in sources:
+
+        await update.effective_message.reply_text(
+            "⚠️ Cette source n'existe pas."
+        )
+
+        return
+
+    sources.remove(
+        source_id
+    )
+
+    persist_config()
+
+    await update.effective_message.reply_text(
+        f"✅ Source supprimée :\n"
+        f"<code>{source_id}</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+# ============================================================
+# /SETDESTINATION
+# ============================================================
+
+async def setdestination_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not await admin_only(
+        update,
+        context
+    ):
+
+        return
+
+    if not context.args:
+
+        await update.effective_message.reply_text(
+            "❌ Utilisation :\n/setdestination ID"
+        )
+
+        return
+
+    try:
+
+        destination = int(
+            context.args[0]
+        )
+
+    except ValueError:
+
+        await update.effective_message.reply_text(
+            "❌ ID invalide."
+        )
+
+        return
+
+    CONFIG["destination"] = destination
+
+    persist_config()
+
+    await update.effective_message.reply_text(
+        f"✅ Destination définie :\n"
+        f"<code>{destination}</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+# ============================================================
+# /ADDANIME
 # ============================================================
 
 async def addanime_command(
@@ -2478,166 +2596,132 @@ async def addanime_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    message = update.effective_message
-
-    if not message:
-        return
-
-    if not context.args:
-
-        await message.reply_text(
-            "❌ <b>Nom de l'anime manquant.</b>\n\n"
-            "Utilisation :\n"
-            "<code>/addanime Nom de l'anime</code>\n\n"
-            "Les alias seront recherchés automatiquement.",
-            parse_mode="HTML"
-        )
+    if not await admin_only(
+        update,
+        context
+    ):
 
         return
 
-    title = " ".join(
-        context.args
+    raw = update.effective_message.text
+
+    raw = re.sub(
+        r"^/addanime(?:@\w+)?\s*",
+        "",
+        raw,
+        flags=re.I
     ).strip()
 
-    if not title:
+    parts = [
+        part.strip()
+        for part in raw.split("|")
+    ]
 
-        await message.reply_text(
-            "❌ Nom invalide."
+    if len(parts) < 2:
+
+        await update.effective_message.reply_text(
+            "❌ Utilisation :\n"
+            "/addanime NOM | SAISON\n\n"
+            "Exemple :\n"
+            "/addanime Mushoku Tensei | 3"
         )
 
         return
 
-    status = await message.reply_text(
-        "🔎 <b>RECHERCHE AUTOMATIQUE</b>\n\n"
-        f"🎬 {title}\n\n"
-        "🌐 Recherche sur Nautiljon...",
-        parse_mode="HTML"
-    )
+    name = parts[0]
 
     try:
 
-        result = await asyncio.to_thread(
-            search_anime_automatically,
-            title
+        season = int(
+            parts[1]
         )
 
-        aliases = result.get(
-            "aliases",
-            [title]
+    except ValueError:
+
+        await update.effective_message.reply_text(
+            "❌ La saison doit être un nombre."
         )
 
-        source = result.get(
-            "source",
-            "Aucune"
-        )
+        return
 
-        aliases = normalize_aliases(
-            aliases
-        )
+    manual_aliases = []
 
-        if title not in aliases:
+    if len(parts) >= 3:
 
-            aliases.insert(
-                0,
-                title
-            )
-
-        # ----------------------------------------------------
-        # ID
-        # ----------------------------------------------------
-
-        anime_id = normalize_text(
-            title
-        )
-
-        anime_id = re.sub(
-            r"\s+",
-            "_",
-            anime_id
-        )
-
-        if not anime_id:
-
-            await status.edit_text(
-                "❌ Impossible de créer l'identifiant."
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Sauvegarde
-        # ----------------------------------------------------
-
-        CONFIG[
-            "animes"
-        ][anime_id] = {
-            "title": title,
-            "aliases": aliases,
-            "alias_source": source,
-        }
-
-        save_config(
-            CONFIG
-        )
-
-        # ----------------------------------------------------
-        # Affichage
-        # ----------------------------------------------------
-
-        lines = [
-            "✅ <b>ANIME AJOUTÉ</b>\n",
-            f"🎬 <b>{title}</b>",
-            f"🆔 <code>{anime_id}</code>",
-            "",
-            f"🌐 Source : <b>{source}</b>",
-            f"🔹 Alias trouvés : <b>{len(aliases)}</b>",
-            "",
-            "📋 <b>Alias :</b>",
+        manual_aliases = [
+            x.strip()
+            for x in parts[2].split(",")
+            if x.strip()
         ]
 
-        for alias in aliases[:30]:
+    CONFIG["animes"][name] = {
 
-            lines.append(
-                f"• {alias}"
-            )
+        "enabled": True,
 
-        if len(aliases) > 30:
+        "season": season,
 
-            lines.append(
-                f"\n... et {len(aliases) - 30} autres"
-            )
+        "aliases": manual_aliases
+    }
 
-        lines.extend([
-            "",
-            "🤖 Aucun alias manuel nécessaire."
-        ])
+    persist_config()
 
-        await status.edit_text(
-            "\n".join(lines),
-            parse_mode="HTML"
+    await update.effective_message.reply_text(
+        "⏳ Recherche automatique des alias..."
+    )
+
+    automatic_aliases = await asyncio.to_thread(
+        fetch_anime_aliases,
+        name
+    )
+
+    added_aliases = add_automatic_aliases(
+        name,
+        automatic_aliases
+    )
+
+    persist_config()
+
+    aliases = CONFIG["animes"][name].get(
+        "aliases",
+        []
+    )
+
+    if aliases:
+
+        alias_text = "\n".join(
+            f"• {alias}"
+            for alias in aliases
         )
+
+    else:
+
+        alias_text = "Aucun alias trouvé."
+
+    text = (
+        "✅ <b>Anime ajouté</b>\n\n"
+
+        f"🎬 <b>{name}</b>\n"
+        f"📀 Saison : {season}\n\n"
+
+        f"🔤 <b>Alias enregistrés :</b>\n"
+        f"{alias_text}"
+    )
+
+    if added_aliases:
 
         logger.info(
-            "Anime ajouté | %s | %s alias | source=%s",
-            title,
-            len(aliases),
-            source
+            f"🔤 {len(added_aliases)} "
+            f"nouveaux alias ajoutés pour {name}"
         )
 
-    except Exception:
-
-        logger.exception(
-            "Erreur /addanime"
-        )
-
-        await status.edit_text(
-            "❌ Une erreur est survenue "
-            "pendant la recherche automatique."
-        )
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML
+    )
 
 
 # ============================================================
-# REMOVEANIME
+# /REMOVEANIME
 # ============================================================
 
 async def removeanime_command(
@@ -2645,496 +2729,404 @@ async def removeanime_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    message = update.effective_message
+    if not await admin_only(
+        update,
+        context
+    ):
 
-    if not message:
         return
 
-    if not context.args:
+    raw = update.effective_message.text
 
-        await message.reply_text(
-            "❌ Utilisation :\n"
-            "<code>/removeanime identifiant</code>",
-            parse_mode="HTML"
+    raw = re.sub(
+        r"^/removeanime(?:@\w+)?\s*",
+        "",
+        raw,
+        flags=re.I
+    ).strip()
+
+    if not raw:
+
+        await update.effective_message.reply_text(
+            "❌ Utilisation :\n/removeanime NOM"
         )
 
         return
 
-    anime_id = normalize_text(
-        " ".join(
-            context.args
-        )
-    ).replace(
-        " ",
-        "_"
-    )
+    animes = CONFIG["animes"]
 
-    anime = CONFIG[
-        "animes"
-    ].pop(
-        anime_id,
-        None
-    )
+    if raw not in animes:
 
-    if anime is None:
-
-        await message.reply_text(
+        await update.effective_message.reply_text(
             "❌ Anime introuvable."
         )
 
         return
 
-    save_config(
-        CONFIG
-    )
+    del animes[raw]
 
-    title = anime.get(
-        "title",
-        anime_id
-    )
+    persist_config()
 
-    await message.reply_text(
-        f"✅ Anime supprimé : <b>{title}</b>",
-        parse_mode="HTML"
+    await update.effective_message.reply_text(
+        f"✅ Anime supprimé : {raw}"
     )
 
 
 # ============================================================
-# ALIASES
+# /ENABLEANIME
 # ============================================================
 
-async def aliases_command(
+async def enableanime_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    message = update.effective_message
-
-    if not message:
-        return
-
-    if not context.args:
-
-        await message.reply_text(
-            "❌ Utilisation :\n\n"
-            "<code>/aliases identifiant</code>",
-            parse_mode="HTML"
-        )
+    if not await admin_only(
+        update,
+        context
+    ):
 
         return
 
-    anime_id = normalize_text(
-        " ".join(
-            context.args
-        )
-    ).replace(
-        " ",
-        "_"
-    )
+    raw = update.effective_message.text
 
-    anime = CONFIG[
-        "animes"
-    ].get(
-        anime_id
-    )
+    raw = re.sub(
+        r"^/enableanime(?:@\w+)?\s*",
+        "",
+        raw,
+        flags=re.I
+    ).strip()
 
-    if not anime:
+    if raw not in CONFIG["animes"]:
 
-        await message.reply_text(
+        await update.effective_message.reply_text(
             "❌ Anime introuvable."
         )
 
         return
 
-    aliases = anime.get(
+    CONFIG["animes"][raw]["enabled"] = True
+
+    persist_config()
+
+    await update.effective_message.reply_text(
+        f"✅ Anime activé : {raw}"
+    )
+
+
+# ============================================================
+# /DISABLEANIME
+# ============================================================
+
+async def disableanime_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not await admin_only(
+        update,
+        context
+    ):
+
+        return
+
+    raw = update.effective_message.text
+
+    raw = re.sub(
+        r"^/disableanime(?:@\w+)?\s*",
+        "",
+        raw,
+        flags=re.I
+    ).strip()
+
+    if raw not in CONFIG["animes"]:
+
+        await update.effective_message.reply_text(
+            "❌ Anime introuvable."
+        )
+
+        return
+
+    CONFIG["animes"][raw]["enabled"] = False
+
+    persist_config()
+
+    await update.effective_message.reply_text(
+        f"❌ Anime désactivé : {raw}"
+    )
+
+
+# ============================================================
+# /ADDALIAS
+# ============================================================
+
+async def addalias_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not await admin_only(
+        update,
+        context
+    ):
+
+        return
+
+    raw = update.effective_message.text
+
+    raw = re.sub(
+        r"^/addalias(?:@\w+)?\s*",
+        "",
+        raw,
+        flags=re.I
+    ).strip()
+
+    parts = [
+        part.strip()
+        for part in raw.split("|", 1)
+    ]
+
+    if len(parts) != 2:
+
+        await update.effective_message.reply_text(
+            "❌ Utilisation :\n"
+            "/addalias NOM | ALIAS\n\n"
+            "Exemple :\n"
+            "/addalias The 100 Girlfriends | Hyakkano"
+        )
+
+        return
+
+    anime_name = parts[0]
+
+    alias = parts[1]
+
+    if anime_name not in CONFIG["animes"]:
+
+        await update.effective_message.reply_text(
+            "❌ Anime introuvable."
+        )
+
+        return
+
+    aliases = CONFIG["animes"][
+        anime_name
+    ].setdefault(
         "aliases",
         []
     )
 
-    if not aliases:
+    if normalize_text(alias) in {
+        normalize_text(x)
+        for x in aliases
+    }:
 
-        await message.reply_text(
-            "📭 Aucun alias enregistré."
+        await update.effective_message.reply_text(
+            "⚠️ Cet alias existe déjà."
         )
 
         return
 
-    source = anime.get(
-        "alias_source",
-        "Inconnue"
+    aliases.append(
+        alias
     )
 
-    lines = [
-        f"🎬 <b>{anime.get('title', anime_id)}</b>",
-        f"🌐 Source : <b>{source}</b>",
+    persist_config()
+
+    await update.effective_message.reply_text(
+        f"✅ Alias ajouté.\n\n"
+        f"🎬 Anime : {anime_name}\n"
+        f"🔤 Alias : {alias}"
+    )
+
+
+# ============================================================
+# /REMOVEALIAS
+# ============================================================
+
+async def removealias_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not await admin_only(
+        update,
+        context
+    ):
+
+        return
+
+    raw = update.effective_message.text
+
+    raw = re.sub(
+        r"^/removealias(?:@\w+)?\s*",
         "",
-        "🔹 <b>Alias :</b>",
+        raw,
+        flags=re.I
+    ).strip()
+
+    parts = [
+        part.strip()
+        for part in raw.split("|", 1)
     ]
 
-    for alias in aliases:
+    if len(parts) != 2:
 
-        lines.append(
-            f"• {alias}"
+        await update.effective_message.reply_text(
+            "❌ Utilisation :\n"
+            "/removealias NOM | ALIAS"
         )
 
-    await message.reply_text(
-        "\n".join(lines),
-        parse_mode="HTML"
+        return
+
+    anime_name = parts[0]
+
+    alias = parts[1]
+
+    if anime_name not in CONFIG["animes"]:
+
+        await update.effective_message.reply_text(
+            "❌ Anime introuvable."
+        )
+
+        return
+
+    aliases = CONFIG["animes"][
+        anime_name
+    ].get(
+        "aliases",
+        []
+    )
+
+    found = None
+
+    for existing in aliases:
+
+        if normalize_text(
+            existing
+        ) == normalize_text(
+            alias
+        ):
+
+            found = existing
+
+            break
+
+    if found is None:
+
+        await update.effective_message.reply_text(
+            "❌ Alias introuvable."
+        )
+
+        return
+
+    aliases.remove(
+        found
+    )
+
+    persist_config()
+
+    await update.effective_message.reply_text(
+        f"✅ Alias supprimé : {found}"
     )
 
 
 # ============================================================
-# CONFIG
+# /STICKER
 # ============================================================
 
-async def config_command(
+async def set_sticker(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    message = update.effective_message
+    if not await admin_only(
+        update,
+        context
+    ):
 
-    if not message:
         return
 
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "📡 Sources",
-                callback_data="cfg_sources"
-            ),
-            InlineKeyboardButton(
-                "📤 Destinations",
-                callback_data="cfg_destinations"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🎬 Animes",
-                callback_data="cfg_animes"
-            ),
-        ],
-    ]
+    context.user_data[
+        "waiting_for_sticker"
+    ] = True
 
-    await message.reply_text(
-        "⚙️ <b>CONFIGURATION</b>\n\n"
-        "Choisis une section :",
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        ),
-        parse_mode="HTML"
+    await update.effective_message.reply_text(
+        "🧩 <b>Configuration du sticker</b>\n\n"
+        "Envoie maintenant le sticker que le bot "
+        "doit envoyer après 3 minutes sans nouvelle vidéo.",
+        parse_mode=ParseMode.HTML
     )
 
 
 # ============================================================
-# CALLBACK
+# RÉCEPTION STICKER
 # ============================================================
 
-async def callback_handler(
+async def receive_sticker(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    query = update.callback_query
+    if not update.message:
 
-    if not query:
         return
 
-    try:
-        await query.answer()
-    except Exception:
-        pass
+    if not update.message.sticker:
 
-    if query.data == "cfg_sources":
-
-        await query.edit_message_text(
-            "📡 <b>SOURCES</b>\n\n"
-            "/sources → Voir\n"
-            "/addsource → Ajouter\n"
-            "/removesource → Supprimer\n"
-            "/linksource → Relier",
-            parse_mode="HTML"
-        )
-
-    elif query.data == "cfg_destinations":
-
-        await query.edit_message_text(
-            "📤 <b>DESTINATIONS</b>\n\n"
-            "/destinations → Voir\n"
-            "/adddestination → Ajouter\n"
-            "/removedestination → Supprimer\n"
-            "/linksource → Relier",
-            parse_mode="HTML"
-        )
-
-    elif query.data == "cfg_animes":
-
-        await query.edit_message_text(
-            "🎬 <b>ANIMES</b>\n\n"
-            "/animes → Voir\n"
-            "/addanime → Ajouter automatiquement\n"
-            "/removeanime → Supprimer\n"
-            "/aliases → Voir les alias",
-            parse_mode="HTML"
-        )
-
-
-# ============================================================
-# NOM FICHIER
-# ============================================================
-
-def get_filename_from_message(message):
-
-    if not message:
-        return None
-
-    if message.document:
-
-        return (
-            message.document.file_name
-            or "document"
-        )
-
-    if message.video:
-
-        return (
-            message.video.file_name
-            or "video"
-        )
-
-    if message.audio:
-
-        return (
-            message.audio.file_name
-            or "audio"
-        )
-
-    return None
-
-
-# ============================================================
-# TRAITEMENT MESSAGE
-# ============================================================
-
-async def process_source_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-
-    if not message:
         return
 
-    chat = update.effective_chat
+    user = update.effective_user
 
-    if not chat:
+    if not user:
+
         return
 
-    source_id = str(
-        chat.id
-    )
-
-    # --------------------------------------------------------
-    # Source
-    # --------------------------------------------------------
-
-    source = CONFIG.get(
-        "sources",
-        {}
-    ).get(
-        source_id
-    )
-
-    if not isinstance(
-        source,
-        dict
+    if not is_admin(
+        user.id
     ):
 
         return
 
     # --------------------------------------------------------
-    # Fichier
+    # On n'enregistre le sticker que si /sticker a été utilisé
     # --------------------------------------------------------
 
-    filename = get_filename_from_message(
-        message
-    )
-
-    if not filename:
-        return
-
-    logger.info(
-        "Fichier reçu | source=%s | %s",
-        source_id,
-        filename
-    )
-
-    # --------------------------------------------------------
-    # Destinations
-    # --------------------------------------------------------
-
-    destinations = get_destinations_for_source(
-        source_id
-    )
-
-    if not destinations:
-
-        logger.warning(
-            "Aucune destination pour %s",
-            source_id
-        )
+    if not context.user_data.get(
+        "waiting_for_sticker",
+        False
+    ):
 
         return
 
-    # --------------------------------------------------------
-    # Anime
-    # --------------------------------------------------------
+    sticker = update.message.sticker
 
-    detected = find_configured_anime(
-        filename
-    )
+    sticker_id = sticker.file_id
 
-    if not detected:
+    CONFIG[
+        "completion_sticker_id"
+    ] = sticker_id
 
-        logger.info(
-            "Anime non configuré : %s",
-            filename
-        )
+    persist_config()
 
-        return
+    context.user_data[
+        "waiting_for_sticker"
+    ] = False
 
-    anime_id, anime = detected
-
-    # --------------------------------------------------------
-    # Caption
-    # --------------------------------------------------------
-
-    caption = build_caption(
-        anime,
-        filename
+    await update.message.reply_text(
+        "✅ <b>Sticker enregistré !</b>\n\n"
+        "🧩 Il sera envoyé automatiquement "
+        "après 3 minutes sans nouvelle vidéo.",
+        parse_mode=ParseMode.HTML
     )
 
     logger.info(
-        "Copie de %s | %s",
-        anime.get(
-            "title",
-            anime_id
-        ),
-        filename
+        "🧩 Nouveau sticker de fin enregistré."
     )
 
-    # --------------------------------------------------------
-    # Copie
-    # --------------------------------------------------------
-
-    for destination_id in destinations:
-
-        try:
-
-            destination_id_int = int(
-                destination_id
-            )
-
-        except ValueError:
-
-            logger.error(
-                "ID destination invalide : %s",
-                destination_id
-            )
-
-            continue
-
-        try:
-
-            await context.bot.copy_message(
-                chat_id=destination_id_int,
-                from_chat_id=chat.id,
-                message_id=message.message_id,
-                caption=caption,
-            )
-
-            logger.info(
-                "Copie réussie : %s -> %s",
-                source_id,
-                destination_id
-            )
-
-        except TelegramError as error:
-
-            logger.error(
-                "Erreur Telegram : %s",
-                error
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Erreur copie"
-            )
-
 
 # ============================================================
-# CHANNEL POST
-# ============================================================
-
-async def channel_post_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    try:
-
-        await process_source_message(
-            update,
-            context
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Erreur channel_post"
-        )
-
-
-# ============================================================
-# MESSAGES GROUPES
-# ============================================================
-
-async def normal_message_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    try:
-
-        message = update.effective_message
-
-        if not message:
-            return
-
-        chat = update.effective_chat
-
-        if not chat:
-            return
-
-        if chat.type == "private":
-            return
-
-        await process_source_message(
-            update,
-            context
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Erreur message"
-        )
-
-
-# ============================================================
-# COMMANDES TELEGRAM
+# MENU TELEGRAM
 # ============================================================
 
 async def post_init(
@@ -3142,221 +3134,117 @@ async def post_init(
 ):
 
     commands = [
+
         BotCommand(
             "start",
-            "Afficher toutes les commandes"
+            "Démarrer le bot"
         ),
+
         BotCommand(
-            "help",
-            "Afficher toutes les commandes"
+            "status",
+            "Voir le statut"
         ),
-        BotCommand(
-            "config",
-            "Configuration"
-        ),
+
         BotCommand(
             "sources",
             "Voir les sources"
         ),
+
         BotCommand(
-            "addsource",
-            "Ajouter une source"
+            "destination",
+            "Voir la destination"
         ),
-        BotCommand(
-            "removesource",
-            "Supprimer une source"
-        ),
-        BotCommand(
-            "destinations",
-            "Voir les destinations"
-        ),
-        BotCommand(
-            "adddestination",
-            "Ajouter une destination"
-        ),
-        BotCommand(
-            "removedestination",
-            "Supprimer une destination"
-        ),
-        BotCommand(
-            "linksource",
-            "Relier source et destination"
-        ),
+
         BotCommand(
             "animes",
             "Voir les animes"
         ),
+
+        BotCommand(
+            "addsource",
+            "Ajouter une source"
+        ),
+
+        BotCommand(
+            "removesource",
+            "Supprimer une source"
+        ),
+
+        BotCommand(
+            "setdestination",
+            "Changer la destination"
+        ),
+
         BotCommand(
             "addanime",
-            "Ajouter automatiquement un anime"
+            "Ajouter un anime"
         ),
+
         BotCommand(
             "removeanime",
             "Supprimer un anime"
         ),
+
         BotCommand(
-            "aliases",
-            "Voir les alias"
+            "enableanime",
+            "Activer un anime"
         ),
+
+        BotCommand(
+            "disableanime",
+            "Désactiver un anime"
+        ),
+
+        BotCommand(
+            "addalias",
+            "Ajouter un alias"
+        ),
+
+        BotCommand(
+            "removealias",
+            "Supprimer un alias"
+        ),
+
+        BotCommand(
+            "sticker",
+            "Configurer le sticker"
+        ),
+
+        BotCommand(
+            "help",
+            "Afficher l'aide"
+        )
     ]
 
-    try:
+    await application.bot.set_my_commands(
+        commands
+    )
 
-        await application.bot.set_my_commands(
-            commands
-        )
-
-        logger.info(
-            "Commandes Telegram configurées."
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Erreur configuration commandes"
-        )
+    logger.info(
+        "📋 Menu Telegram configuré."
+    )
 
 
 # ============================================================
-# ERREUR
+# ERREUR GLOBALE
 # ============================================================
 
 async def error_handler(
     update,
-    context: ContextTypes.DEFAULT_TYPE
+    context
 ):
 
     logger.error(
-        "Erreur Telegram : %s",
-        context.error,
-        exc_info=context.error
+        f"❌ Exception : {context.error}"
     )
 
+    if context.error:
 
-# ============================================================
-# CONFIG AU DÉMARRAGE
-# ============================================================
-
-def log_configuration():
-
-    logger.info(
-        "=========================================="
-    )
-
-    logger.info(
-        "CONFIGURATION DU BOT"
-    )
-
-    logger.info(
-        "=========================================="
-    )
-
-    sources = CONFIG.get(
-        "sources",
-        {}
-    )
-
-    logger.info(
-        "Sources : %d",
-        len(sources)
-    )
-
-    for source_id, source in sources.items():
-
-        if not isinstance(
-            source,
-            dict
-        ):
-            continue
-
-        logger.info(
-            "Source : %s | %s | destinations=%s",
-            source_id,
-            source.get(
-                "title",
-                source_id
-            ),
-            source.get(
-                "destinations",
-                []
-            )
+        traceback.print_exception(
+            type(context.error),
+            context.error,
+            context.error.__traceback__
         )
-
-    destinations = CONFIG.get(
-        "destinations",
-        {}
-    )
-
-    logger.info(
-        "Destinations : %d",
-        len(destinations)
-    )
-
-    for destination_id, destination in destinations.items():
-
-        if isinstance(
-            destination,
-            dict
-        ):
-
-            title = destination.get(
-                "title",
-                destination_id
-            )
-
-        else:
-
-            title = destination_id
-
-        logger.info(
-            "Destination : %s | %s",
-            destination_id,
-            title
-        )
-
-    animes = CONFIG.get(
-        "animes",
-        {}
-    )
-
-    logger.info(
-        "Animes : %d",
-        len(animes)
-    )
-
-    for anime_id, anime in animes.items():
-
-        if not isinstance(
-            anime,
-            dict
-        ):
-            continue
-
-        logger.info(
-            "Anime : %s | alias=%d | source=%s",
-            anime.get(
-                "title",
-                anime_id
-            ),
-            len(
-                anime.get(
-                    "aliases",
-                    []
-                )
-            ),
-            anime.get(
-                "alias_source",
-                "?"
-            )
-        )
-
-    logger.info(
-        "=========================================="
-    )
-
-    save_config(
-        CONFIG
-    )
 
 
 # ============================================================
@@ -3365,25 +3253,64 @@ def log_configuration():
 
 def main():
 
-    log_configuration()
+    logger.info(
+        "🤖 AUTO FORWARDER démarré..."
+    )
+
+    logger.info(
+        f"📁 Configuration : {CONFIG_FILE}"
+    )
+
+    logger.info(
+        f"📡 Sources : "
+        f"{CONFIG.get('sources', [])}"
+    )
+
+    logger.info(
+        f"🎯 Destination : "
+        f"{CONFIG.get('destination')}"
+    )
+
+    logger.info(
+        f"🎬 Animes configurés : "
+        f"{len(CONFIG.get('animes', {}))}"
+    )
+
+    logger.info(
+        "⏱️ Délai sticker : 3 minutes"
+    )
+
+    # ========================================================
+    # HTTP
+    # ========================================================
+
+    request = HTTPXRequest(
+
+        connect_timeout=30.0,
+
+        read_timeout=60.0,
+
+        write_timeout=60.0,
+
+        pool_timeout=30.0
+    )
+
+    # ========================================================
+    # APPLICATION
+    # ========================================================
 
     application = (
-        Application.builder()
-        .token(
-            os.getenv(
-                "BOT_TOKEN",
-                "8734390269:AAF0K4N-8Crsr1Tjsy50FQS6RwemjVShma0"
-            )
-        )
-        .post_init(
-            post_init
-        )
+        Application
+        .builder()
+        .token(TOKEN)
+        .request(request)
+        .post_init(post_init)
         .build()
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # COMMANDES
-    # --------------------------------------------------------
+    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -3401,19 +3328,29 @@ def main():
 
     application.add_handler(
         CommandHandler(
-            "config",
-            config_command
+            "status",
+            status_command
         )
     )
-
-    # --------------------------------------------------------
-    # SOURCES
-    # --------------------------------------------------------
 
     application.add_handler(
         CommandHandler(
             "sources",
             sources_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "destination",
+            destination_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "animes",
+            animes_command
         )
     )
 
@@ -3431,46 +3368,10 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # DESTINATIONS
-    # --------------------------------------------------------
-
     application.add_handler(
         CommandHandler(
-            "destinations",
-            destinations_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "adddestination",
-            adddestination_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "removedestination",
-            removedestination_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "linksource",
-            linksource_command
-        )
-    )
-
-    # --------------------------------------------------------
-    # ANIMES
-    # --------------------------------------------------------
-
-    application.add_handler(
-        CommandHandler(
-            "animes",
-            list_animes
+            "setdestination",
+            setdestination_command
         )
     )
 
@@ -3490,79 +3391,88 @@ def main():
 
     application.add_handler(
         CommandHandler(
-            "aliases",
-            aliases_command
+            "enableanime",
+            enableanime_command
         )
     )
-
-    # --------------------------------------------------------
-    # CALLBACKS
-    # --------------------------------------------------------
 
     application.add_handler(
-        CallbackQueryHandler(
-            callback_handler
+        CommandHandler(
+            "disableanime",
+            disableanime_command
         )
     )
 
-    # --------------------------------------------------------
-    # PUBLICATIONS CANAUX
-    # --------------------------------------------------------
+    application.add_handler(
+        CommandHandler(
+            "addalias",
+            addalias_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "removealias",
+            removealias_command
+        )
+    )
+
+    # ========================================================
+    # STICKER
+    # ========================================================
+
+    application.add_handler(
+        CommandHandler(
+            "sticker",
+            set_sticker
+        )
+    )
 
     application.add_handler(
         MessageHandler(
-            filters.UpdateType.CHANNEL_POST
-            & ~filters.COMMAND,
-            channel_post_handler
+            filters.Sticker.ALL,
+            receive_sticker
         )
     )
 
-    # --------------------------------------------------------
-    # MESSAGES GROUPES
-    # --------------------------------------------------------
+    # ========================================================
+    # MÉDIAS
+    # ========================================================
+
+    media_filter = (
+        filters.Document.ALL
+        | filters.VIDEO
+        | filters.AUDIO
+    )
 
     application.add_handler(
         MessageHandler(
-            filters.UpdateType.MESSAGE
-            & ~filters.COMMAND,
-            normal_message_handler
-        ),
-        group=10
+            media_filter,
+            handle_message
+        )
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # ERREURS
-    # --------------------------------------------------------
+    # ========================================================
 
     application.add_error_handler(
         error_handler
     )
 
-    logger.info(
-        "=========================================="
-    )
-
-    logger.info(
-        "BOT PRÊT"
-    )
-
-    logger.info(
-        "=========================================="
-    )
+    # ========================================================
+    # POLLING
+    # ========================================================
 
     application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=[
-            "message",
-            "channel_post",
-            "callback_query",
-        ]
+        drop_pending_updates=False
     )
 
 
 # ============================================================
-# START PROGRAMME
+# LANCEMENT
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
