@@ -67,7 +67,7 @@ from telegram.request import HTTPXRequest
 # d'environnement, sinon le bot refuse de démarrer / personne
 # n'a les droits admin.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8734390269:AAF0K4N-8Crsr1Tjsy50FQS6RwemjVShma0").strip()
-CONFIG_FILE = "config_A.json"
+CONFIG_FILE = "config_B.json"
 GITHUB_REPO = os.getenv("GITHUB_REPO", "jinwooleboss/Chien.git").strip()
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip()
 DEFAULT_STICKER_DELAY = 180
