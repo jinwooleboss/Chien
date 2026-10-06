@@ -66,9 +66,9 @@ from telegram.request import HTTPXRequest
 # dur. BOT_TOKEN et ADMIN_IDS DOIVENT être définis en variables
 # d'environnement, sinon le bot refuse de démarrer / personne
 # n'a les droits admin.
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8734390269:AAF0K4N-8Crsr1Tjsy50FQS6RwemjVShma0").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CONFIG_FILE = "config_B.json"
-GITHUB_REPO = os.getenv("GITHUB_REPO", "jinwooleboss/Chien.git").strip()
+GITHUB_REPO = os.getenv("GITHUB_REPO", "").strip()
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip()
 DEFAULT_STICKER_DELAY = 180
 DEFAULT_ADMIN_IDS: List[int] = []
@@ -121,7 +121,7 @@ PROCESSED_FILE = "processed_messages.json"
 # ============================================================
 
 def get_admin_ids() -> List[int]:
-    value = os.getenv("ADMIN_IDS", "5825526159").strip()
+    value = os.getenv("ADMIN_IDS", "").strip()
     if not value:
         logger.warning(
             "⚠️ ADMIN_IDS n'est pas défini : AUCUN administrateur "
